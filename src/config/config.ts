@@ -68,6 +68,9 @@ const EnvSchema = v.object({
     v.minLength(1, "Password is required"),
     v.transform(strongPasswordTransform),
   ),
+  // Optional: separates App-Passwort fuer IMAP/SMTP/Sieve (mailbox.org trennt
+  // E-Mail-App-Passwoerter von CalDAV/CardDAV-App-Passwoertern). Fallback: MAILBOX_PASSWORD.
+  MAILBOX_EMAIL_PASSWORD: v.optional(v.pipe(v.string(), v.minLength(1))),
 
   // Optional IMAP configuration
   MAILBOX_IMAP_HOST: v.optional(v.pipe(v.string(), v.minLength(1))),
@@ -192,6 +195,9 @@ export function loadConfig(): ServerConfig {
     // We've validated these exist and are secure, so they're safe to use
     const email = validatedEnv.MAILBOX_EMAIL;
     const password = validatedEnv.MAILBOX_PASSWORD;
+    // IMAP/SMTP/Sieve nutzen das E-Mail-App-Passwort, falls gesetzt; sonst MAILBOX_PASSWORD.
+    // CalDAV bleibt auf MAILBOX_PASSWORD (CalDAV/CardDAV-App-Passwort).
+    const mailPassword = validatedEnv.MAILBOX_EMAIL_PASSWORD || password;
 
     // Security recommendations logging (non-sensitive info only)
     if (password.length < 12) {
@@ -216,14 +222,14 @@ export function loadConfig(): ServerConfig {
         port: validatedEnv.MAILBOX_IMAP_PORT || 993,
         secure: validatedEnv.MAILBOX_IMAP_SECURE !== "false",
         user: email,
-        password: password,
+        password: mailPassword,
       },
       smtp: {
         host: validatedEnv.MAILBOX_SMTP_HOST || "smtp.mailbox.org",
         port: validatedEnv.MAILBOX_SMTP_PORT || 465,
         secure: validatedEnv.MAILBOX_SMTP_SECURE !== "false",
         user: email,
-        password: password,
+        password: mailPassword,
       },
       calendar: {
         baseUrl: validatedEnv.MAILBOX_CALDAV_URL || "https://dav.mailbox.org/",
@@ -236,7 +242,7 @@ export function loadConfig(): ServerConfig {
         port: validatedEnv.MAILBOX_SIEVE_PORT || 2000,
         secure: validatedEnv.MAILBOX_SIEVE_SECURE === "true",
         user: email,
-        password: password,
+        password: mailPassword,
       },
       cache: {
         email: {
