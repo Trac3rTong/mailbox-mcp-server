@@ -2,6 +2,46 @@
 
 ALWAYS verify your changes by running the tests with `bun run test`!
 
+## Fork-Status (Hendrik, Stand 2026-08-23)
+
+Dies ist ein Fork von `soenkenils/mailbox-mcp-server` (git-Remote `origin`, upstream, kein
+Push-Recht). Eigener Fork-Remote `fork` = `Trac3rTong/mailbox-mcp-server`. Der Server läuft produktiv
+und liefert Hendriks `mcp__mailbox__*`-Tools in Claude Desktop.
+
+**Entrypoint ist `src/main.ts`** (nicht `src/index.ts`, wie weiter unten in diesem Dokument steht —
+das ist generischer Upstream-Text).
+
+**Dual-Password (Fork-Erweiterung):** mailbox.org trennt App-Passwörter nach Protokoll. Neben
+`MAILBOX_PASSWORD` (= CalDAV/CardDAV) gibt es die optionale Variable `MAILBOX_EMAIL_PASSWORD`
+(= IMAP/SMTP/Sieve). Ohne sie Fallback auf `MAILBOX_PASSWORD`. Werte mit Sonderzeichen in der `.env`
+in Anführungszeichen setzen (dotenv kappt sonst am `#`).
+
+**Happy-Eyeballs:** `src/utils/happyEyeballs.ts` löst A+AAAA auf und rennt parallele TCP-Connects,
+weil nodemailer kein Happy-Eyeballs macht und je nach Netz/VPN nur eine Adress-Family erreichbar ist.
+
+**Erledigt:**
+1. Der Commit `4cc80cc` (Dual-Password + `.gitignore`) liegt als Branch `dual-password-local` auf dem
+   Fork (`fork/dual-password-local`) und ist damit gesichert. PR #4 (`fix/smtp-happy-eyeballs-windows`)
+   enthält weiterhin nur Happy-Eyeballs + Windows-Fix; ob Dual-Password dort dazu soll, ist bewusst
+   offen gelassen (wäre Scope-Erweiterung).
+2. **SMTP-Zertifikatsprüfung aktiv (2026-08-23).** `src/services/SmtpConnectionPool.ts` steht auf
+   `rejectUnauthorized: true`. `tls.servername` ist durch den Happy-Eyeballs-Fix auf `smtp.mailbox.org`
+   gesetzt, damit verifiziert TLS korrekt trotz IP-Literal-Host. IMAP/CalDAV/Sieve prüften immer korrekt.
+
+**Offene Punkte:**
+1. **Sieve-Werkzeuge gesperrt (Incident 2026-08-23).** Der `SieveService` meldet nachweislich Falsches:
+   `LISTSCRIPTS` lieferte null Skripte bei drei vorhandenen, `GETSCRIPT` gab die Login-Antwort zurück
+   (Antwort-Zuordnung im Response-Reader). Client-Literale werden als `{n}` statt `{n+}` gesendet
+   (RFC 5804), die Länge kommt aus `content.length` statt aus der Oktett-Länge. Ein `SETACTIVE` aus
+   einer Claude-Sitzung hat 47 produktive Filterregeln der App Suite stillgelegt — ManageSieve erlaubt
+   genau ein aktives Skript. Bis zur Reparatur nicht benutzen. Für Sieve-Arbeiten den unabhängigen
+   Client `C:\Projects\Familien-Kalender\sieve_add_rule.py` verwenden (Backup, `CHECKSCRIPT`,
+   Zurückleseprobe, Rollback).
+2. Vollständiger Review des Servers läuft, Leitlinse „stille Falschauskunft“ (Werkzeug meldet Erfolg
+   oder Leere, obwohl die Operation fehlschlug). Bis die Befundliste vorliegt, keine Reparaturen.
+
+Projekt-Memory (cross-system): `_claude-memory/projects/familien-kalender/memory/`.
+
 ## Project Overview
 
 This is a Model Context Protocol (MCP) server for mailbox.org integration, providing:
