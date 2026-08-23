@@ -1,12 +1,12 @@
 import type { createDAVClient } from "tsdav";
 import {
-  type Mock,
   afterAll,
   beforeAll,
   beforeEach,
   describe,
   expect,
   it,
+  type Mock,
   vi,
 } from "vitest";
 import { CalendarService } from "../src/services/CalendarService.js";
@@ -104,9 +104,7 @@ vi.mock("tsdav", () => {
   }
 
   return {
-    createDAVClient: vi.fn(function () {
-      return new MockDAVClient();
-    }),
+    createDAVClient: vi.fn(() => new MockDAVClient()),
     DAVClient: MockDAVClient,
   };
 });
@@ -308,21 +306,18 @@ describe("CalendarService", () => {
       ["Meeting", 0],
       ["event", 1],
       ["", 1], // Empty query should return all events
-    ])(
-      "should filter events by query '%s' and return %d results",
-      async (query, expectedCount) => {
-        const testData = createTestICalData({ summary: "Test Event" });
-        mockFetchCalendarObjects.mockResolvedValue([{ data: testData }]);
+    ])("should filter events by query '%s' and return %d results", async (query, expectedCount) => {
+      const testData = createTestICalData({ summary: "Test Event" });
+      mockFetchCalendarObjects.mockResolvedValue([{ data: testData }]);
 
-        const result = await calendarService.searchCalendar({
-          start: new Date("2025-06-20T00:00:00Z"),
-          end: new Date("2025-06-21T00:00:00Z"),
-          query,
-        });
+      const result = await calendarService.searchCalendar({
+        start: new Date("2025-06-20T00:00:00Z"),
+        end: new Date("2025-06-21T00:00:00Z"),
+        query,
+      });
 
-        expect(result).toHaveLength(expectedCount);
-      },
-    );
+      expect(result).toHaveLength(expectedCount);
+    });
   });
 
   describe("getFreeBusy", () => {
@@ -348,24 +343,21 @@ describe("CalendarService", () => {
       ["2025-06-20T12:00:00Z", "2025-06-21T00:00:00Z"],
       ["2025-06-19T00:00:00Z", "2025-06-20T09:00:00Z"], // Before event
       ["2025-06-20T12:00:00Z", "2025-06-21T00:00:00Z"], // After event
-    ])(
-      "should handle different date ranges from %s to %s",
-      async (startStr, endStr) => {
-        mockFetchCalendarObjects.mockResolvedValue([
-          { data: createTestICalData() },
-        ]);
+    ])("should handle different date ranges from %s to %s", async (startStr, endStr) => {
+      mockFetchCalendarObjects.mockResolvedValue([
+        { data: createTestICalData() },
+      ]);
 
-        const start = new Date(startStr);
-        const end = new Date(endStr);
+      const start = new Date(startStr);
+      const end = new Date(endStr);
 
-        const result = await calendarService.getFreeBusy(start, end);
+      const result = await calendarService.getFreeBusy(start, end);
 
-        expect(result.start).toEqual(start);
-        expect(result.end).toEqual(end);
-        expect(Array.isArray(result.busy)).toBe(true);
-        expect(Array.isArray(result.free)).toBe(true);
-      },
-    );
+      expect(result.start).toEqual(start);
+      expect(result.end).toEqual(end);
+      expect(Array.isArray(result.busy)).toBe(true);
+      expect(Array.isArray(result.free)).toBe(true);
+    });
   });
 
   describe("discoverCalendars", () => {
@@ -392,16 +384,14 @@ describe("CalendarService", () => {
       expect(result).toContain("work");
     });
 
-    it("should return default calendar on error", async () => {
-      // Mock fetchCalendars to throw an error
+    it("should fail rather than invent a calendar named 'personal'", async () => {
       mockFetchCalendars.mockRejectedValueOnce(new Error("Failed to fetch"));
 
-      const result = await (
-        calendarService as TestableCalendarService
-      ).discoverCalendars();
-
-      // Should return the default calendar on error
-      expect(result).toEqual(["personal"]);
+      // Used to resolve with ["personal"], a name the server never returned.
+      // Every later query then ran against it and legitimately found nothing.
+      await expect(
+        (calendarService as TestableCalendarService).discoverCalendars(),
+      ).rejects.toThrow("Failed to fetch");
     });
   });
 
@@ -448,20 +438,20 @@ describe("CalendarService", () => {
   });
 
   describe("error handling", () => {
-    it("should handle fetch errors gracefully", async () => {
-      // Mock fetchCalendarObjects to throw an error
+    it("should surface a fetch error instead of reporting an empty calendar", async () => {
       mockFetchCalendarObjects.mockRejectedValueOnce(
         new Error("Network error"),
       );
 
-      const result = await calendarService.getCalendarEvents({
-        start: new Date("2025-06-20T00:00:00Z"),
-        end: new Date("2025-06-21T00:00:00Z"),
-      });
-
-      // Should return an empty array on error
-      expect(Array.isArray(result)).toBe(true);
-      expect(result).toHaveLength(0);
+      // Used to resolve with []. "No appointments" and "the calendar could not
+      // be read" then looked identical, and the empty list was additionally
+      // cached as a valid answer for 15 minutes.
+      await expect(
+        calendarService.getCalendarEvents({
+          start: new Date("2025-06-20T00:00:00Z"),
+          end: new Date("2025-06-21T00:00:00Z"),
+        }),
+      ).rejects.toThrow("Network error");
     });
 
     it.each([
@@ -469,15 +459,31 @@ describe("CalendarService", () => {
       ["Authentication failed", "AUTH_ERROR"],
       ["Server unavailable", "SERVER_ERROR"],
       ["Rate limit exceeded", "RATE_LIMIT"],
-    ])("should handle %s error", async (description, errorType) => {
+    ])("should surface a %s error", async (description, errorType) => {
       mockFetchCalendarObjects.mockRejectedValueOnce(new Error(errorType));
 
-      const result = await calendarService.getCalendarEvents({
-        start: new Date("2025-06-20T00:00:00Z"),
-        end: new Date("2025-06-21T00:00:00Z"),
-      });
+      await expect(
+        calendarService.getCalendarEvents({
+          start: new Date("2025-06-20T00:00:00Z"),
+          end: new Date("2025-06-21T00:00:00Z"),
+        }),
+      ).rejects.toThrow(errorType);
+    });
 
-      expect(result).toEqual([]);
+    it("should never report a window as free when the lookup failed", async () => {
+      mockFetchCalendarObjects.mockRejectedValueOnce(
+        new Error("Network error"),
+      );
+
+      // The old default answered every failure with busy: [] and the whole
+      // window as free — the one direction that leads to accepting an
+      // appointment for a slot that is actually taken.
+      await expect(
+        calendarService.getFreeBusy(
+          new Date("2025-06-20T00:00:00Z"),
+          new Date("2025-06-21T00:00:00Z"),
+        ),
+      ).rejects.toThrow("Network error");
     });
 
     it("should handle cache errors gracefully", async () => {
@@ -547,16 +553,13 @@ describe("CalendarService", () => {
       ["case insensitive location", "virtual", 1, "4"],
       ["no matches", "xyz-not-found", 0, null],
       ["empty string", "", 4, null],
-    ])(
-      "should filter %s",
-      (scenario, query, expectedCount, expectedFirstId) => {
-        const results = calendarService.testFilterEventsByQuery(events, query);
-        expect(results).toHaveLength(expectedCount);
-        if (expectedFirstId) {
-          expect(results[0].id).toBe(expectedFirstId);
-        }
-      },
-    );
+    ])("should filter %s", (scenario, query, expectedCount, expectedFirstId) => {
+      const results = calendarService.testFilterEventsByQuery(events, query);
+      expect(results).toHaveLength(expectedCount);
+      if (expectedFirstId) {
+        expect(results[0].id).toBe(expectedFirstId);
+      }
+    });
 
     it("should return all events when query is undefined", () => {
       const results = calendarService.testFilterEventsByQuery(

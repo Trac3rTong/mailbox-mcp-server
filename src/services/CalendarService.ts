@@ -9,6 +9,7 @@ import type {
   CalendarSearchOptions,
   FreeBusyInfo,
 } from "../types/calendar.types.js";
+import { classifyTransportError } from "../types/errors.js";
 import { withCacheFallback } from "../utils/cacheFallback.js";
 import {
   CircuitBreaker,
@@ -70,7 +71,8 @@ export class CalendarService {
         const events = await this.fetchCalendarEvents(options);
         return events;
       },
-      defaultValue: [],
+      // No defaultValue: an empty list would claim the calendar is empty when
+      // the truth is that it could not be read.
       logger: this.logger,
       operation: "getCalendarEvents",
       service: "CalendarService",
@@ -92,7 +94,7 @@ export class CalendarService {
         const filteredEvents = this.filterEventsByQuery(events, options.query);
         return filteredEvents;
       },
-      defaultValue: [],
+      // No defaultValue, see getCalendarEvents.
       logger: this.logger,
       operation: "searchCalendar",
       service: "CalendarService",
@@ -121,12 +123,9 @@ export class CalendarService {
         const freeBusy = this.calculateFreeBusy(events, start, end);
         return freeBusy;
       },
-      defaultValue: {
-        start,
-        end,
-        busy: [],
-        free: [{ start, end }],
-      },
+      // No defaultValue. The previous one declared the entire window free on any
+      // connection failure, which is the one direction that leads to a wrong
+      // commitment: an appointment accepted for a slot that is actually taken.
       logger: this.logger,
       operation: "getFreeBusy",
       service: "CalendarService",
@@ -172,7 +171,13 @@ export class CalendarService {
           error: error instanceof Error ? error.message : String(error),
         },
       );
-      return [];
+      // Never answer a failed fetch with an empty list: "no events" and "could
+      // not reach the calendar" are indistinguishable to the caller, and the
+      // empty array used to be cached as a valid result for 15 minutes.
+      throw classifyTransportError(error, {
+        operation: "getEvents",
+        service: "CalendarService",
+      });
     }
   }
 
@@ -195,7 +200,13 @@ export class CalendarService {
         },
         { error: error instanceof Error ? error.message : String(error) },
       );
-      return ["personal"];
+      // Inventing a calendar named "personal" made every later query run against
+      // a name the server never returned, which then legitimately produced no
+      // events. Fail here instead.
+      throw classifyTransportError(error, {
+        operation: "getCalendarList",
+        service: "CalendarService",
+      });
     }
   }
 
@@ -247,7 +258,13 @@ export class CalendarService {
           error: error instanceof Error ? error.message : String(error),
         },
       );
-      return [];
+      // One unreachable calendar out of several used to yield a shorter list
+      // that looked complete. A partial answer presented as whole is worse than
+      // no answer, so this propagates and fails the whole query.
+      throw classifyTransportError(error, {
+        operation: "fetchCalendarEvents",
+        service: "CalendarService",
+      });
     }
   }
 
