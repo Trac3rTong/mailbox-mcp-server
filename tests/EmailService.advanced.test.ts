@@ -1,4 +1,4 @@
-import { type Mock, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ConnectionPoolConfig } from "../src/services/ConnectionPool.js";
 import { EmailService } from "../src/services/EmailService.js";
 import type { LocalCache } from "../src/types/cache.types.js";
@@ -10,6 +10,11 @@ import type {
   ImapConnection,
   ImapConnectionWrapper,
 } from "../src/types/email.types.js";
+import {
+  AuthenticationError,
+  ConnectionError,
+  ErrorCode,
+} from "../src/types/errors.js";
 
 // Test helper interface for accessing private methods
 interface TestableEmailService extends EmailService {
@@ -58,13 +63,19 @@ const createMockConnection = (
 const createMockConnectionWrapper = (
   overrides: Partial<ImapConnectionWrapper> = {},
 ): ImapConnectionWrapper => ({
+  // The mutating ImapFlow calls resolve to a BOOLEAN (and mailboxCreate to an
+  // object). Bare vi.fn() resolved to undefined, which let the service treat a
+  // refused operation as a successful one without any test noticing.
   connection: {
     mailboxOpen: vi.fn(),
-    messageMove: vi.fn(),
-    messageFlagsAdd: vi.fn(),
-    messageFlagsRemove: vi.fn(),
+    messageMove: vi.fn().mockResolvedValue(true),
+    messageFlagsAdd: vi.fn().mockResolvedValue(true),
+    messageFlagsRemove: vi.fn().mockResolvedValue(true),
+    messageDelete: vi.fn().mockResolvedValue(true),
     append: vi.fn(),
-    mailboxCreate: vi.fn(),
+    mailboxCreate: vi
+      .fn()
+      .mockResolvedValue({ path: "NewFolder", created: true }),
     list: vi.fn(),
   } as any,
   folder: "INBOX",
@@ -75,16 +86,20 @@ const createMockConnectionWrapper = (
 const mockConnect = vi.fn();
 const mockLogout = vi.fn();
 const mockMailboxOpen = vi.fn();
-const mockMessageMove = vi.fn();
-const mockMessageFlagsAdd = vi.fn();
-const mockMessageFlagsRemove = vi.fn();
+const mockMessageMove = vi.fn().mockResolvedValue(true);
+const mockMessageFlagsAdd = vi.fn().mockResolvedValue(true);
+const mockMessageFlagsRemove = vi.fn().mockResolvedValue(true);
+const mockMessageDelete = vi.fn().mockResolvedValue(true);
 const mockAppend = vi.fn();
-const mockMailboxCreate = vi.fn();
+const mockMailboxCreate = vi
+  .fn()
+  .mockResolvedValue({ path: "NewFolder", created: true });
 const mockList = vi.fn();
 
 // Mock the imapflow module
 vi.mock("imapflow", () => {
   return {
+    // biome-ignore lint/complexity/useArrowFunction: invoked with `new`, an arrow function is not constructible
     ImapFlow: vi.fn(function () {
       return {
         connect: mockConnect,
@@ -93,6 +108,7 @@ vi.mock("imapflow", () => {
         messageMove: mockMessageMove,
         messageFlagsAdd: mockMessageFlagsAdd,
         messageFlagsRemove: mockMessageFlagsRemove,
+        messageDelete: mockMessageDelete,
         append: mockAppend,
         mailboxCreate: mockMailboxCreate,
         list: mockList,
@@ -111,6 +127,7 @@ const mockOfflineService = {
 };
 
 vi.mock("../src/services/OfflineService.js", () => ({
+  // biome-ignore lint/complexity/useArrowFunction: invoked with `new`, an arrow function is not constructible
   OfflineService: vi.fn(function () {
     return mockOfflineService;
   }),
@@ -128,6 +145,7 @@ const mockPool = {
 };
 
 vi.mock("../src/services/ImapConnectionPool.js", () => ({
+  // biome-ignore lint/complexity/useArrowFunction: invoked with `new`, an arrow function is not constructible
   ImapConnectionPool: vi.fn(function () {
     return mockPool;
   }),
@@ -142,9 +160,7 @@ const mockLogger = {
 };
 
 vi.mock("../src/services/Logger.js", () => ({
-  createLogger: vi.fn(function () {
-    return mockLogger;
-  }),
+  createLogger: vi.fn(() => mockLogger),
 }));
 
 describe("EmailService - Advanced Coverage", () => {
@@ -180,35 +196,13 @@ describe("EmailService - Advanced Coverage", () => {
   });
 
   describe("getDefaultFolders", () => {
-    it("should return standard IMAP folders", () => {
-      const folders = service.getDefaultFolders();
-      expect(folders).toHaveLength(4);
-      expect(folders.map(f => f.name)).toEqual([
-        "INBOX",
-        "Sent",
-        "Drafts",
-        "Trash",
-      ]);
-    });
-
-    it("should have correct special use flags", () => {
-      const folders = service.getDefaultFolders();
-      const folderMap = Object.fromEntries(
-        folders.map(f => [f.name, f.specialUse]),
-      );
-
-      expect(folderMap.INBOX).toBeUndefined();
-      expect(folderMap.Sent).toBe("\\Sent");
-      expect(folderMap.Drafts).toBe("\\Drafts");
-      expect(folderMap.Trash).toBe("\\Trash");
-    });
-
-    it("should use standard delimiter", () => {
-      const folders = service.getDefaultFolders();
-      for (const folder of folders) {
-        expect(folder.delimiter).toBe("/");
-        expect(folder.flags).toEqual([]);
-      }
+    it("no longer exists: a failed listing must not be answered with invented folders", () => {
+      // getDefaultFolders() returned a fabricated INBOX/Sent/Drafts/Trash list
+      // whenever the real listing failed, so the caller could not tell a broken
+      // connection from a mailbox that happens to hold those four folders.
+      expect(
+        (service as unknown as Record<string, unknown>).getDefaultFolders,
+      ).toBeUndefined();
     });
   });
 
@@ -695,7 +689,7 @@ describe("EmailService - Advanced Coverage", () => {
   });
 
   describe("deleteEmail", () => {
-    it("should permanently delete email with \\Deleted flag", async () => {
+    it("should actually expunge on permanent delete, not just flag", async () => {
       const mockWrapper = createMockConnectionWrapper();
       mockPool.acquireForFolder.mockResolvedValue(mockWrapper);
       mockPool.releaseFromFolder.mockResolvedValue(undefined);
@@ -704,11 +698,24 @@ describe("EmailService - Advanced Coverage", () => {
 
       expect(result.success).toBe(true);
       expect(result.message).toBe("Email permanently deleted");
-      expect(mockWrapper.connection.messageFlagsAdd).toHaveBeenCalledWith(
+      // messageDelete sets \Deleted AND expunges. Setting the flag alone left
+      // the message in place while the tool claimed it was gone.
+      expect(mockWrapper.connection.messageDelete).toHaveBeenCalledWith(
         "123:123",
-        ["\\Deleted"],
         { uid: true },
       );
+      expect(mockWrapper.connection.messageFlagsAdd).not.toHaveBeenCalled();
+    });
+
+    it("should report failure when the server refuses the delete", async () => {
+      const mockWrapper = createMockConnectionWrapper();
+      mockWrapper.connection.messageDelete = vi.fn().mockResolvedValue(false);
+      mockPool.acquireForFolder.mockResolvedValue(mockWrapper);
+      mockPool.releaseFromFolder.mockResolvedValue(undefined);
+
+      const result = await service.deleteEmail(123, "INBOX", true);
+
+      expect(result.success).toBe(false);
     });
 
     it("should move to Trash folder for soft delete", async () => {
@@ -732,7 +739,7 @@ describe("EmailService - Advanced Coverage", () => {
       mockWrapper.connection.messageMove = vi
         .fn()
         .mockRejectedValueOnce(new Error("Trash not found"))
-        .mockResolvedValueOnce(undefined); // Succeeds on "Deleted Items"
+        .mockResolvedValueOnce(true); // Succeeds on "Deleted Items"
 
       mockPool.acquireForFolder.mockResolvedValue(mockWrapper);
       mockPool.releaseFromFolder.mockResolvedValue(undefined);
@@ -789,7 +796,8 @@ describe("EmailService - Advanced Coverage", () => {
 
     it("should handle errors and return failure result", async () => {
       const mockWrapper = createMockConnectionWrapper();
-      mockWrapper.connection.messageFlagsAdd = vi
+      // Permanent deletion goes through messageDelete now, not messageFlagsAdd.
+      mockWrapper.connection.messageDelete = vi
         .fn()
         .mockRejectedValue(new Error("Delete failed"));
       mockPool.acquireForFolder.mockResolvedValue(mockWrapper);
@@ -1050,9 +1058,16 @@ describe("EmailService - Advanced Coverage", () => {
       (service as any).cache.get = mockGet;
 
       const mockWrapper = createMockConnectionWrapper();
+      // A typed ConnectionError, not an Error whose message merely contains the
+      // word "connection". The fallback is keyed on the class now.
       mockWrapper.connection.list = vi
         .fn()
-        .mockRejectedValue(new Error("Connection timeout"));
+        .mockRejectedValue(
+          new ConnectionError(
+            "Connection timeout",
+            ErrorCode.CONNECTION_TIMEOUT,
+          ),
+        );
       mockPool.acquire.mockResolvedValue(mockWrapper);
       mockPool.release.mockResolvedValue(undefined);
 
@@ -1072,34 +1087,50 @@ describe("EmailService - Advanced Coverage", () => {
       );
     });
 
-    it("should return default folders on connection error without cache", async () => {
+    it("should fail rather than invent folders when there is no cache", async () => {
       const mockGet = vi.fn().mockReturnValue(null);
       (service as any).cache.get = mockGet;
 
       const mockWrapper = createMockConnectionWrapper();
       mockWrapper.connection.list = vi
         .fn()
-        .mockRejectedValue(new Error("Connection timeout"));
+        .mockRejectedValue(
+          new ConnectionError(
+            "Connection timeout",
+            ErrorCode.CONNECTION_TIMEOUT,
+          ),
+        );
       mockPool.acquire.mockResolvedValue(mockWrapper);
       mockPool.release.mockResolvedValue(undefined);
 
       const mockGetStale = vi.fn().mockReturnValue(null);
       (service as any).cache.getStale = mockGetStale;
 
-      const result = await service.getFolders();
+      // Used to resolve with a fabricated INBOX/Sent/Drafts/Trash list.
+      await expect(service.getFolders()).rejects.toThrow("Connection timeout");
+    });
 
-      expect(result).toHaveLength(4); // INBOX, Sent, Drafts, Trash
-      expect(result.map(f => f.name)).toEqual([
-        "INBOX",
-        "Sent",
-        "Drafts",
-        "Trash",
-      ]);
-      expect(mockLogger.warning).toHaveBeenCalledWith(
-        "No cached data available, returning default value due to connection failure",
-        expect.any(Object),
-        expect.any(Object),
-      );
+    it("should not treat an authentication failure as a connection error", async () => {
+      const mockGet = vi.fn().mockReturnValue(null);
+      (service as any).cache.get = mockGet;
+      (service as any).cache.getStale = vi.fn().mockReturnValue(null);
+
+      const mockWrapper = createMockConnectionWrapper();
+      // ConnectionPool used to wrap this into "Failed to create connection after
+      // N attempts: …", whose text matched the old substring check, so a wrong
+      // password produced an empty folder list instead of an error.
+      mockWrapper.connection.list = vi
+        .fn()
+        .mockRejectedValue(
+          new AuthenticationError(
+            "Invalid credentials",
+            ErrorCode.AUTH_INVALID_CREDENTIALS,
+          ),
+        );
+      mockPool.acquire.mockResolvedValue(mockWrapper);
+      mockPool.release.mockResolvedValue(undefined);
+
+      await expect(service.getFolders()).rejects.toThrow("Invalid credentials");
     });
 
     it("should throw non-connection errors", async () => {
@@ -1158,7 +1189,7 @@ describe("EmailService - Advanced Coverage", () => {
       );
     });
 
-    it("should create nested folder with parent path", async () => {
+    it("should pass a nested path in array form so the server's delimiter is used", async () => {
       const mockWrapper = createMockConnectionWrapper();
       mockPool.acquire.mockResolvedValue(mockWrapper);
       mockPool.release.mockResolvedValue(undefined);
@@ -1166,21 +1197,28 @@ describe("EmailService - Advanced Coverage", () => {
       const result = await service.createDirectory("SubFolder", "INBOX");
 
       expect(result.success).toBe(true);
-      expect(mockWrapper.connection.mailboxCreate).toHaveBeenCalledWith(
-        "INBOX/SubFolder",
-      );
+      // Previously joined with a hardcoded "/", called the "standard IMAP
+      // delimiter". There is no standard one; Dovecot-style servers use ".".
+      // The array form lets ImapFlow apply whatever the server announced.
+      expect(mockWrapper.connection.mailboxCreate).toHaveBeenCalledWith([
+        "INBOX",
+        "SubFolder",
+      ]);
     });
 
-    it("should use standard delimiter", async () => {
+    it("should report when the folder already existed instead of claiming creation", async () => {
       const mockWrapper = createMockConnectionWrapper();
+      mockWrapper.connection.mailboxCreate = vi
+        .fn()
+        .mockResolvedValue({ path: "Existing", created: false });
       mockPool.acquire.mockResolvedValue(mockWrapper);
       mockPool.release.mockResolvedValue(undefined);
 
-      await service.createDirectory("SubFolder", "Parent/Nested");
+      const result = await service.createDirectory("Existing");
 
-      expect(mockWrapper.connection.mailboxCreate).toHaveBeenCalledWith(
-        "Parent/Nested/SubFolder",
-      );
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("already existed");
+      expect(result.message).not.toContain("created successfully");
     });
 
     it("should handle errors gracefully", async () => {
@@ -1243,17 +1281,13 @@ describe("EmailService - Advanced Coverage", () => {
         [],
       ],
       ["empty array", [], []],
-    ])(
-      "should parse %s",
-      (
-        _description: string,
-        input: unknown,
-        expected: Array<{ name?: string; address: string }>,
-      ) => {
-        const testableService = service as TestableEmailService;
-        const result = testableService.parseAddressesFromParsed(input);
-        expect(result).toEqual(expected);
-      },
-    );
+    ])("should parse %s", (_description: string, input: unknown, expected: Array<{
+      name?: string;
+      address: string;
+    }>) => {
+      const testableService = service as TestableEmailService;
+      const result = testableService.parseAddressesFromParsed(input);
+      expect(result).toEqual(expected);
+    });
   });
 });

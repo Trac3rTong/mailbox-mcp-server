@@ -102,7 +102,8 @@ export class EmailService {
           }
         }
       },
-      defaultValue: [],
+      // No defaultValue: "Found 0 emails" must mean the mailbox was searched and
+      // held nothing, not that the search never reached the server.
       logger: this.logger,
       operation: "searchEmails",
       service: "EmailService",
@@ -124,7 +125,8 @@ export class EmailService {
           const message = await this.fetchEmailByUid(wrapper, uid, folder);
           return message;
         },
-        defaultValue: null,
+        // No defaultValue: null is the answer for "this UID does not exist", so
+        // it must not double as the answer for "the lookup failed".
         logger: this.logger,
         operation: "getEmail",
         service: "EmailService",
@@ -671,7 +673,9 @@ export class EmailService {
 
           return result;
         },
-        defaultValue: this.getDefaultFolders(),
+        // No defaultValue: getDefaultFolders() invented INBOX/Sent/Drafts/Trash
+        // out of thin air, so a failed listing was indistinguishable from a
+        // mailbox that happens to have exactly those four folders.
         logger: this.logger,
         operation: "getFolders",
         service: "EmailService",
@@ -693,9 +697,24 @@ export class EmailService {
 
     try {
       wrapper = await this.pool.acquireForFolder(fromFolder);
-      await wrapper.connection.messageMove(`${uid}:${uid}`, toFolder, {
-        uid: true,
-      });
+      // ImapFlow signals a server-side refusal (missing target folder, message
+      // not found) with a falsy return value rather than an exception. Ignoring
+      // it reported a successful move that never took place.
+      const moved = await wrapper.connection.messageMove(
+        `${uid}:${uid}`,
+        toFolder,
+        {
+          uid: true,
+        },
+      );
+      if (!moved) {
+        throw new EmailError(
+          `Server refused to move UID ${uid} from ${fromFolder} to ${toFolder}. The target folder may not exist.`,
+          ErrorCode.OPERATION_FAILED,
+          String(uid),
+          fromFolder,
+        );
+      }
 
       // Clear cache for both folders
       this.clearFolderCache(fromFolder);
@@ -745,14 +764,29 @@ export class EmailService {
     try {
       wrapper = await this.pool.acquireForFolder(folder);
 
-      if (action === "add") {
-        await wrapper.connection.messageFlagsAdd(`${uid}:${uid}`, flags, {
-          uid: true,
-        });
-      } else {
-        await wrapper.connection.messageFlagsRemove(`${uid}:${uid}`, flags, {
-          uid: true,
-        });
+      // Like messageMove, the flag calls return false instead of throwing when
+      // the mailbox is not selected or the server does not accept the flag (a
+      // flag outside permanentFlags, for instance). Without this check the tool
+      // reported success although no STORE ever went over the wire.
+      const applied =
+        action === "add"
+          ? await wrapper.connection.messageFlagsAdd(`${uid}:${uid}`, flags, {
+              uid: true,
+            })
+          : await wrapper.connection.messageFlagsRemove(
+              `${uid}:${uid}`,
+              flags,
+              {
+                uid: true,
+              },
+            );
+      if (!applied) {
+        throw new EmailError(
+          `Server refused to ${action} flags [${flags.join(", ")}] on UID ${uid} in ${folder}. The flag may not be permitted in this mailbox.`,
+          ErrorCode.OPERATION_FAILED,
+          String(uid),
+          folder,
+        );
       }
 
       // Clear cache for the folder
@@ -799,53 +833,86 @@ export class EmailService {
       wrapper = await this.pool.acquireForFolder(folder);
 
       if (permanent) {
-        // Add deleted flag and expunge
-        await wrapper.connection.messageFlagsAdd(
+        // messageDelete sets \Deleted AND expunges. The previous code only set
+        // the flag and left expunge commented out, so nothing was ever removed
+        // while the tool reported "permanently deleted".
+        const deleted = await wrapper.connection.messageDelete(
           `${uid}:${uid}`,
-          ["\\Deleted"],
           {
             uid: true,
           },
         );
-        // Note: expunge is called automatically after messageDelete in newer ImapFlow versions
-        // await wrapper.connection.expunge(); // This method may not exist in current ImapFlow version
+        if (!deleted) {
+          throw new EmailError(
+            `Server did not delete message UID ${uid} in ${folder}`,
+            ErrorCode.OPERATION_FAILED,
+            String(uid),
+            folder,
+          );
+        }
       } else {
-        // Move to Trash folder
+        // messageMove returns false on server-side refusal instead of throwing,
+        // so the catch below is not enough on its own: treat a falsy result as a
+        // failed move and fall through to the alternative folder names.
+        let moved = false;
         try {
-          await wrapper.connection.messageMove(`${uid}:${uid}`, "Trash", {
-            uid: true,
-          });
-        } catch (moveError) {
-          // If Trash folder doesn't exist, try other common names
+          moved = Boolean(
+            await wrapper.connection.messageMove(`${uid}:${uid}`, "Trash", {
+              uid: true,
+            }),
+          );
+        } catch {
+          moved = false;
+        }
+
+        if (!moved) {
           const trashFolders = ["Deleted Items", "Deleted", "INBOX.Trash"];
-          let moved = false;
 
           for (const trashFolder of trashFolders) {
             try {
-              await wrapper.connection.messageMove(
-                `${uid}:${uid}`,
-                trashFolder,
-                {
-                  uid: true,
-                },
-              );
-              moved = true;
-              break;
-            } catch (error) {
-              // Continue to next folder
+              if (
+                await wrapper.connection.messageMove(
+                  `${uid}:${uid}`,
+                  trashFolder,
+                  {
+                    uid: true,
+                  },
+                )
+              ) {
+                moved = true;
+                break;
+              }
+            } catch {
+              // Try the next candidate name.
             }
           }
+        }
 
-          if (!moved) {
-            // If no trash folder found, mark as deleted
-            await wrapper.connection.messageFlagsAdd(
-              `${uid}:${uid}`,
-              ["\\Deleted"],
-              {
-                uid: true,
-              },
+        if (!moved) {
+          // No trash folder reachable. Flagging as \Deleted is a weaker outcome
+          // than moving, so say so instead of reporting a move that never
+          // happened.
+          const flagged = await wrapper.connection.messageFlagsAdd(
+            `${uid}:${uid}`,
+            ["\\Deleted"],
+            {
+              uid: true,
+            },
+          );
+          if (!flagged) {
+            throw new EmailError(
+              `Could not move UID ${uid} to any trash folder, and marking it \\Deleted was refused`,
+              ErrorCode.OPERATION_FAILED,
+              String(uid),
+              folder,
             );
           }
+          this.clearFolderCache(folder);
+          return {
+            success: true,
+            message:
+              "No trash folder was reachable. The email was marked \\Deleted in place and still exists.",
+          };
         }
       }
 
@@ -1008,40 +1075,6 @@ export class EmailService {
     }
   }
 
-  private getDefaultFolders(): EmailFolder[] {
-    // Return a basic set of folders when connection is not available
-    return [
-      {
-        name: "INBOX",
-        path: "INBOX",
-        delimiter: "/",
-        flags: [],
-        specialUse: undefined,
-      },
-      {
-        name: "Sent",
-        path: "Sent",
-        delimiter: "/",
-        flags: [],
-        specialUse: "\\Sent",
-      },
-      {
-        name: "Drafts",
-        path: "Drafts",
-        delimiter: "/",
-        flags: [],
-        specialUse: "\\Drafts",
-      },
-      {
-        name: "Trash",
-        path: "Trash",
-        delimiter: "/",
-        flags: [],
-        specialUse: "\\Trash",
-      },
-    ];
-  }
-
   // Pool management methods
   getPoolMetrics() {
     return this.pool.getImapMetrics();
@@ -1098,17 +1131,26 @@ export class EmailService {
     try {
       wrapper = await this.pool.acquire();
 
-      // Construct the full folder path
-      // Use standard IMAP delimiter
-      const delimiter = "/"; // Standard IMAP delimiter
-      const folderPath = parentPath ? `${parentPath}${delimiter}${name}` : name;
+      // Pass the path in array form so ImapFlow joins it with the delimiter the
+      // server actually announced. The previous code hardcoded "/" and called it
+      // the "standard IMAP delimiter"; there is no such thing, mailbox.org and
+      // Dovecot-style servers commonly use ".".
+      const target: string | string[] = parentPath ? [parentPath, name] : name;
 
-      // Create the folder using IMAP CREATE command
-      await wrapper.connection.mailboxCreate(folderPath);
+      const result = await wrapper.connection.mailboxCreate(target);
+
+      // mailboxCreate resolves with created:false when the folder was already
+      // there. Reporting that as "created successfully" hid the difference.
+      if (result && result.created === false) {
+        return {
+          success: true,
+          message: `Directory '${name}' already existed at '${result.path}', nothing was created`,
+        };
+      }
 
       return {
         success: true,
-        message: `Directory '${name}' created successfully`,
+        message: `Directory '${name}' created successfully at '${result?.path ?? name}'`,
       };
     } catch (error) {
       await this.logger.error(
