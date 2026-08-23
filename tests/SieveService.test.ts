@@ -31,8 +31,11 @@ describe("SieveService", () => {
   let sieveService: SieveService;
   let mockSocket: unknown;
 
+  // 127.0.0.1 statt imap.mailbox.org: die Tests unten rufen echte Methoden auf und
+  // erzeugten bei JEDEM Suite-Lauf einen Fehl-Login gegen den Produktivhost (fail2ban).
+  // Nicht zurueckstellen, bevor es einen injizierbaren Transport-Mock gibt.
   const mockConfig: SieveConnection = {
-    host: "imap.mailbox.org",
+    host: "127.0.0.1",
     port: 4190,
     secure: false,
     user: "test@mailbox.org",
