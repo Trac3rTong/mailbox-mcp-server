@@ -1,3 +1,4 @@
+import { classifyTransportError } from "../types/errors.js";
 import { createLogger } from "./Logger.js";
 
 export interface ConnectionPoolConfig {
@@ -258,6 +259,17 @@ export abstract class ConnectionPool<T> {
         lastError = error instanceof Error ? error : new Error(String(error));
         this.recordConnectionCreationError(lastError, attempt);
 
+        // Retrying a rejected password just produces more failed logins, and
+        // mailbox.org runs fail2ban. Give up immediately on anything the error
+        // taxonomy marks as not retryable (auth failures, TLS rejections).
+        const classified = classifyTransportError(error, {
+          operation: "createConnection",
+          service: "ConnectionPool",
+        });
+        if (!classified.isRetryable) {
+          throw classified;
+        }
+
         // If this is not the last attempt, wait with exponential backoff
         if (attempt < this.config.maxRetries) {
           await this.handleConnectionCreationError(lastError, attempt);
@@ -265,9 +277,15 @@ export abstract class ConnectionPool<T> {
       }
     }
 
-    throw new Error(
-      `Failed to create connection after ${this.config.maxRetries + 1} attempts: ${lastError?.message || "Unknown error"}`,
-    );
+    // Preserve the KIND of the failure. Flattening it into a generic Error whose
+    // message contained "connection" made every cause — wrong password, rejected
+    // certificate, locked mailbox — look like a network outage to the cache
+    // fallback, which then answered with an empty result instead of failing.
+    throw classifyTransportError(lastError, {
+      operation: "createConnection",
+      service: "ConnectionPool",
+      details: { attempts: this.config.maxRetries + 1 },
+    });
   }
 
   private async createConnectionWrapper(): Promise<ConnectionWrapper<T>> {

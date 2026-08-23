@@ -67,6 +67,7 @@ class MockImapFlow {
 
 // Mock the imapflow module
 vi.mock("imapflow", () => ({
+  // biome-ignore lint/complexity/useArrowFunction: invoked with `new`, an arrow function is not constructible
   ImapFlow: vi.fn(function () {
     return new MockImapFlow();
   }),
@@ -82,6 +83,7 @@ describe("ImapConnectionPool", () => {
 
     // Reset the mock implementation to ensure clean state
     const { ImapFlow } = await import("imapflow");
+    // biome-ignore lint/complexity/useArrowFunction: invoked with `new`
     vi.mocked(ImapFlow).mockImplementation(function () {
       return new MockImapFlow();
     });
@@ -127,13 +129,16 @@ describe("ImapConnectionPool", () => {
       mockImapFlow.setShouldFailConnect(true);
 
       const { ImapFlow } = await import("imapflow");
+      // biome-ignore lint/complexity/useArrowFunction: invoked with `new`
       vi.mocked(ImapFlow).mockImplementation(function () {
         return mockImapFlow;
       });
 
-      await expect(pool.acquire()).rejects.toThrow(
-        "Failed to create connection",
-      );
+      // The pool used to flatten every cause into "Failed to create connection
+      // after N attempts: …". That wording matched the cache fallback's
+      // substring check, so a rejected password looked like a network outage and
+      // produced an empty result. The original message is preserved now.
+      await expect(pool.acquire()).rejects.toThrow("IMAP connection failed");
     });
   });
 
@@ -214,6 +219,7 @@ describe("ImapConnectionPool", () => {
       mockImapFlow.setShouldFailMailboxOpen(true);
 
       const { ImapFlow } = await import("imapflow");
+      // biome-ignore lint/complexity/useArrowFunction: invoked with `new`
       vi.mocked(ImapFlow).mockImplementation(function () {
         return mockImapFlow;
       });

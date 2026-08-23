@@ -356,6 +356,145 @@ export class ConfigurationError extends MCPError {
 }
 
 /**
+ * Node and library error codes that identify a genuine transport failure.
+ *
+ * These are matched on the error CODE, never on message text. The message is
+ * written by whoever threw it and changes between library versions; the code is
+ * part of the contract. Matching text is how a wrong password came to be
+ * indistinguishable from a network outage: every failure was wrapped in a
+ * message containing the word "connection", and the cache fallback then served
+ * an empty result for all of them.
+ */
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ERR_SOCKET_CONNECTION_TIMEOUT",
+]);
+
+/** Authentication rejections. imapflow, nodemailer and tsdav all surface one of these. */
+const AUTH_ERROR_CODES = new Set([
+  "AUTHENTICATIONFAILED",
+  "AUTHORIZATIONFAILED",
+  "EAUTH",
+  "NO",
+  "PRIVACYREQUIRED",
+]);
+
+/**
+ * TLS failures. Deliberately NOT treated as connection errors: a rejected
+ * certificate must reach the caller, never be softened into "no results".
+ */
+const TLS_ERROR_CODES = new Set([
+  "CERT_HAS_EXPIRED",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_HANDSHAKE_TIMEOUT",
+]);
+
+function errorCodeOf(error: unknown, depth = 0): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const candidate = error as {
+    code?: unknown;
+    responseCode?: unknown;
+    serverResponseCode?: unknown;
+  };
+  for (const value of [
+    candidate.code,
+    candidate.responseCode,
+    candidate.serverResponseCode,
+  ]) {
+    if (typeof value === "string" && value.length > 0)
+      return value.toUpperCase();
+  }
+
+  // Node's fetch (used by tsdav for CalDAV) reports "TypeError: fetch failed"
+  // and hides the real reason one level down in `cause`. Without following it,
+  // an unreachable CalDAV host looks like an unclassified server error and the
+  // stale-cache fallback never applies. Depth-limited to avoid cyclic causes.
+  const nested = (error as { cause?: unknown }).cause;
+  if (nested && nested !== error && depth < 3) {
+    return errorCodeOf(nested, depth + 1);
+  }
+
+  return undefined;
+}
+
+/**
+ * Turn an arbitrary transport failure into a typed MCPError.
+ *
+ * The class of the result decides what happens downstream: only ConnectionError
+ * may be softened into cached or default data, everything else has to reach the
+ * caller. Classify at the point where the failure is known, never by guessing
+ * from a message further up the stack.
+ */
+export function classifyTransportError(
+  error: unknown,
+  context: ErrorContext = {},
+): MCPError {
+  if (error instanceof MCPError) {
+    return error;
+  }
+
+  const cause = error instanceof Error ? error : new Error(String(error));
+  const code = errorCodeOf(error);
+
+  if (code && AUTH_ERROR_CODES.has(code)) {
+    return new AuthenticationError(
+      cause.message,
+      ErrorCode.AUTH_INVALID_CREDENTIALS,
+      context,
+    );
+  }
+
+  // imapflow marks auth rejections with a boolean rather than a code.
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { authenticationFailed?: unknown }).authenticationFailed === true
+  ) {
+    return new AuthenticationError(
+      cause.message,
+      ErrorCode.AUTH_INVALID_CREDENTIALS,
+      context,
+    );
+  }
+
+  if (code && TLS_ERROR_CODES.has(code)) {
+    return new ConfigurationError(
+      `TLS verification failed: ${cause.message}`,
+      "tls",
+      context,
+    );
+  }
+
+  if (code && NETWORK_ERROR_CODES.has(code)) {
+    const errorCode =
+      code === "ETIMEDOUT" || code === "ERR_SOCKET_CONNECTION_TIMEOUT"
+        ? ErrorCode.CONNECTION_TIMEOUT
+        : code === "ECONNREFUSED"
+          ? ErrorCode.CONNECTION_REFUSED
+          : ErrorCode.CONNECTION_FAILED;
+    return new ConnectionError(cause.message, errorCode, context);
+  }
+
+  // Unclassified: surface it rather than assume it was the network.
+  return new MailboxError(
+    cause.message,
+    ErrorCode.OPERATION_FAILED,
+    undefined,
+    context,
+  );
+}
+
+/**
  * Check if an error is retryable
  */
 export function isRetryableError(error: Error): boolean {
