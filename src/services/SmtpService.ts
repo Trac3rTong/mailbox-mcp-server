@@ -64,9 +64,35 @@ export class SmtpService {
 
       const info = await transporter.sendMail(mailOptions);
 
+      // nodemailer only throws when EVERY recipient was refused. On a partial
+      // rejection it resolves successfully and records the refused addresses in
+      // info.rejected, which this code used to ignore — the caller was then told
+      // all recipients had been served.
+      const rejected = (info.rejected ?? []).map((entry: unknown) =>
+        typeof entry === "string" ? entry : String(entry),
+      );
+      const accepted = (info.accepted ?? []).map((entry: unknown) =>
+        typeof entry === "string" ? entry : String(entry),
+      );
+
+      if (rejected.length > 0) {
+        return {
+          success: false,
+          message:
+            `Delivery was refused for ${rejected.length} recipient(s): ${rejected.join(", ")}.` +
+            (accepted.length > 0
+              ? ` Accepted: ${accepted.join(", ")}.`
+              : " No recipient accepted the message."),
+          messageId: info.messageId,
+        };
+      }
+
       return {
         success: true,
-        message: "Email sent successfully",
+        message:
+          accepted.length > 0
+            ? `Email accepted for ${accepted.join(", ")}`
+            : "Email sent successfully",
         messageId: info.messageId,
       };
     } catch (error) {
@@ -77,7 +103,15 @@ export class SmtpService {
           service: "SmtpService",
         },
         {
-          composition,
+          // Metadata only. This used to pass the whole composition — subject,
+          // body, HTML and attachment buffers — into the log and the MCP
+          // notification channel, against the project's own "never log email
+          // content" rule.
+          recipientCount:
+            (composition.to?.length ?? 0) +
+            (composition.cc?.length ?? 0) +
+            (composition.bcc?.length ?? 0),
+          hasAttachments: (composition.attachments?.length ?? 0) > 0,
           error: error instanceof Error ? error.message : String(error),
         },
       );
