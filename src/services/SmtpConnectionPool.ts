@@ -59,7 +59,7 @@ export class SmtpConnectionPool extends ConnectionPool<Transporter> {
         pass: this.smtpConfig.password,
       },
       tls: {
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
         servername,
       },
       pool: false, // We handle pooling ourselves
