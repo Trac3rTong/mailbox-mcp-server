@@ -30,6 +30,26 @@ export interface SieveResponse {
   data?: unknown;
 }
 
+/**
+ * Byte-level ManageSieve channel. Kept deliberately thin — no protocol logic —
+ * so tests can inject a fake session and drive the SieveService's parsing and
+ * command sequencing without touching a socket.
+ */
+export interface SieveTransport {
+  /** Open the connection and resolve once ready to read the server greeting. */
+  connect(): Promise<void>;
+  /** True once the channel is TLS-encrypted. */
+  isSecure(): boolean;
+  /** Upgrade an in-band plaintext connection to TLS (STARTTLS). */
+  startTls(): Promise<void>;
+  /** Write raw bytes to the server. */
+  write(data: Buffer): void;
+  /** Resolve with exactly one complete, literal-framed response. */
+  readResponse(): Promise<Buffer>;
+  /** Send LOGOUT best-effort and tear the connection down. */
+  close(): void;
+}
+
 export interface FilterCondition {
   type: "header" | "address" | "envelope" | "body" | "size" | "date";
   field?: string;

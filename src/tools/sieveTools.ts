@@ -35,10 +35,12 @@ const GetSieveScriptSchema = v.object({
   name: v.pipe(v.string(), v.minLength(1), v.maxLength(100)),
 });
 
+// No `activate` here on purpose: writing a script must never change which script
+// is active. Activation is a separate, guarded tool. A default-true activate is
+// exactly what silenced 47 production filter rules on 2026-08-23.
 const CreateSieveFilterSchema = v.object({
   name: v.pipe(v.string(), v.minLength(1), v.maxLength(100)),
   content: v.pipe(v.string(), v.minLength(1)),
-  activate: v.optional(v.boolean(), true),
 });
 
 const DeleteSieveScriptSchema = v.object({
@@ -81,7 +83,8 @@ export function getSieveTools(): Tool[] {
     },
     {
       name: "create_sieve_filter",
-      description: "Create or update a Sieve filter script",
+      description:
+        "Create or update a Sieve filter script. Validates (CHECKSCRIPT) then stores it. Does NOT activate it — the account keeps whichever script is currently active. To make a script the active one, call activate_sieve_script explicitly.",
       inputSchema: {
         type: "object",
         properties: {
@@ -95,11 +98,6 @@ export function getSieveTools(): Tool[] {
             type: "string",
             description: "Sieve script content (RFC 5228 compliant)",
             minLength: 1,
-          },
-          activate: {
-            type: "boolean",
-            description: "Whether to activate the script after creation",
-            default: true,
           },
         },
         required: ["name", "content"],
@@ -123,7 +121,8 @@ export function getSieveTools(): Tool[] {
     },
     {
       name: "activate_sieve_script",
-      description: "Activate a specific Sieve script (deactivates others)",
+      description:
+        "Activate a specific Sieve script. The account allows exactly one active script, so this DEACTIVATES the currently active one. The target must already exist (checked against list_sieve_scripts); the currently active script is reported so the switch is never silent.",
       inputSchema: {
         type: "object",
         properties: {
@@ -311,17 +310,10 @@ async function handleCreateSieveFilter(
   await sieveService.connect();
   await sieveService.authenticate();
 
-  // First validate the script
+  // Validate first (CHECKSCRIPT), then store. Never activate here — a write must
+  // not change which script the account runs.
   await sieveService.checkScript(args.content);
-
-  // Then save it
   await sieveService.putScript(args.name, args.content);
-
-  let activationMsg = "";
-  if (args.activate) {
-    await sieveService.setActiveScript(args.name);
-    activationMsg = " and activated";
-  }
 
   logger.info(
     "Created Sieve script",
@@ -332,7 +324,6 @@ async function handleCreateSieveFilter(
     {
       scriptName: args.name,
       contentLength: args.content.length,
-      activated: args.activate,
     },
   );
 
@@ -340,7 +331,7 @@ async function handleCreateSieveFilter(
     content: [
       {
         type: "text",
-        text: `Successfully created Sieve script '${args.name}'${activationMsg}.`,
+        text: `Stored Sieve script '${args.name}' (validated). It is NOT active — the currently active script is unchanged. Use activate_sieve_script to switch.`,
       },
     ],
   };
@@ -387,6 +378,37 @@ async function handleActivateSieveScript(
   await sieveService.connect();
   await sieveService.authenticate();
 
+  // Guard: never switch blindly. Confirm the target exists and report which
+  // script is being deactivated, so a mistaken name cannot silence the active
+  // script the way the 2026-08-23 incident did.
+  const scripts = await sieveService.listScripts();
+  const target = scripts.find(s => s.name === args.name);
+  if (!target) {
+    const available = scripts.map(s => s.name).join(", ") || "(none)";
+    return {
+      content: [
+        {
+          type: "text",
+          text: `No Sieve script named '${args.name}'. Nothing was activated. Existing scripts: ${available}.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const previouslyActive = scripts.find(s => s.active && s.name !== args.name);
+
+  if (target.active) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Sieve script '${args.name}' is already the active script. Nothing changed.`,
+        },
+      ],
+    };
+  }
+
   await sieveService.setActiveScript(args.name);
 
   logger.info(
@@ -397,14 +419,18 @@ async function handleActivateSieveScript(
     },
     {
       scriptName: args.name,
+      deactivated: previouslyActive?.name,
     },
   );
 
+  const switched = previouslyActive
+    ? ` This deactivated '${previouslyActive.name}', which was active before.`
+    : "";
   return {
     content: [
       {
         type: "text",
-        text: `Successfully activated Sieve script '${args.name}'.`,
+        text: `Activated Sieve script '${args.name}'.${switched}`,
       },
     ],
   };

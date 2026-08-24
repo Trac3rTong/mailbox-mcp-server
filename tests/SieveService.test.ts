@@ -1,617 +1,259 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SieveService } from "../src/services/SieveService.js";
+import {
+  SieveService,
+  extractScriptContent,
+  findResponseEnd,
+  parseListScripts,
+} from "../src/services/SieveService.js";
 import type {
-  SieveCapabilities,
   SieveConnection,
-  SieveScript,
+  SieveTransport,
 } from "../src/types/sieve.types.js";
 
-// Testable subclass to access private methods
-class TestableSieveService extends SieveService {
-  public testParseScriptList(data: string): SieveScript[] {
-    return (this as any).parseScriptList(data);
-  }
-
-  public testParseCapabilities(data: string): SieveCapabilities {
-    return (this as any).parseCapabilities(data);
-  }
-}
-
-// Mock the logger
 vi.mock("../src/services/Logger.js", () => ({
   createLogger: vi.fn(() => ({
     debug: vi.fn(),
     info: vi.fn(),
+    warning: vi.fn(),
     error: vi.fn(),
-    warn: vi.fn(),
   })),
 }));
 
-describe("SieveService", () => {
-  let sieveService: SieveService;
-  let mockSocket: unknown;
+const config: SieveConnection = {
+  host: "127.0.0.1",
+  port: 4190,
+  secure: false,
+  user: "test@mailbox.org",
+  password: "pw",
+};
 
-  // 127.0.0.1 statt imap.mailbox.org: die Tests unten rufen echte Methoden auf und
-  // erzeugten bei JEDEM Suite-Lauf einen Fehl-Login gegen den Produktivhost (fail2ban).
-  // Nicht zurueckstellen, bevor es einen injizierbaren Transport-Mock gibt.
-  const mockConfig: SieveConnection = {
-    host: "127.0.0.1",
-    port: 4190,
-    secure: false,
-    user: "test@mailbox.org",
-    password: "test-password",
-  };
+const b = (s: string) => Buffer.from(s, "utf8");
 
-  beforeEach(() => {
-    // Create mock socket
-    mockSocket = {
-      connect: vi.fn(),
-      write: vi.fn(),
-      destroy: vi.fn(),
-      on: vi.fn(),
-      removeListener: vi.fn(),
-    };
+/**
+ * Scripted ManageSieve session. Returns queued response buffers in order and
+ * records exactly what the service wrote — so tests drive full command cycles
+ * without a socket.
+ */
+class FakeTransport implements SieveTransport {
+  writes: Buffer[] = [];
+  private queue: Buffer[];
+  private secureFlag: boolean;
 
-    sieveService = new SieveService(mockConfig);
-  });
+  constructor(responses: Buffer[], startSecure = false) {
+    this.queue = [...responses];
+    this.secureFlag = startSecure;
+  }
 
-  describe("connection management", () => {
-    it("should start in disconnected state", () => {
-      expect(sieveService.isConnected()).toBe(false);
-      expect(sieveService.isAuthenticated()).toBe(false);
-    });
+  connect(): Promise<void> {
+    return Promise.resolve();
+  }
+  isSecure(): boolean {
+    return this.secureFlag;
+  }
+  startTls(): Promise<void> {
+    this.secureFlag = true;
+    return Promise.resolve();
+  }
+  write(data: Buffer): void {
+    this.writes.push(data);
+  }
+  readResponse(): Promise<Buffer> {
+    const next = this.queue.shift();
+    if (!next) return Promise.reject(new Error("no scripted response left"));
+    return Promise.resolve(next);
+  }
+  close(): void {}
 
-    it("should expose server capabilities getter", () => {
-      const capabilities = sieveService.getServerCapabilities();
-      expect(capabilities).toBeNull();
-    });
-  });
-
-  describe("script validation", () => {
-    it("should accept valid Sieve script syntax", async () => {
-      const validScript = `require ["fileinto"];
-if header :contains "From" "example.com" {
-  fileinto "Example";
-  stop;
-}`;
-
-      // Note: This test validates the script format, not actual server validation
-      // Real validation happens when checkScript() calls the server
-      expect(validScript).toBeTruthy();
-      expect(validScript).toContain("require");
-      expect(validScript).toContain("fileinto");
-    });
-
-    it("should handle complex Sieve scripts", () => {
-      const complexScript = `require ["fileinto", "envelope", "regex"];
-
-# Important documents
-if anyof (
-  header :contains "From" "docusign.net",
-  header :contains "Subject" ["Contract", "Agreement"]
-) {
-  fileinto "Important";
-  stop;
+  writtenText(): string {
+    return Buffer.concat(this.writes).toString("utf8");
+  }
 }
 
-# Newsletter filtering
-if header :contains "From" [
-  "newsletter@example.com",
-  "news@company.com"
-] {
-  fileinto "Newsletter";
-  stop;
-}`;
+const GREETING_WITH_TLS = b(
+  '"IMPLEMENTATION" "Dovecot Pigeonhole"\r\n"SIEVE" "fileinto envelope"\r\n"STARTTLS"\r\nOK "ready"\r\n',
+);
+const STARTTLS_OK = b('OK "Begin TLS negotiation"\r\n');
+const POST_TLS_CAPS = b(
+  '"IMPLEMENTATION" "Dovecot Pigeonhole"\r\n"SIEVE" "fileinto"\r\nOK\r\n',
+);
+const AUTH_OK = b('OK "Logged in."\r\n');
 
-      expect(complexScript).toBeTruthy();
-      expect(complexScript).toContain("anyof");
-      expect(complexScript).toContain("fileinto");
-    });
+/** The four responses consumed by connect()+authenticate() over STARTTLS. */
+const handshake = () => [GREETING_WITH_TLS, STARTTLS_OK, POST_TLS_CAPS, AUTH_OK];
+
+describe("findResponseEnd (byte-accurate)", () => {
+  it("returns -1 until a terminator arrives", () => {
+    expect(findResponseEnd(b(""))).toBe(-1);
+    expect(findResponseEnd(b("OK no crlf yet"))).toBe(-1);
+    expect(findResponseEnd(b("{50}\r\nonly a few bytes"))).toBe(-1);
   });
 
-  describe("parseScriptList", () => {
-    it("should parse script list response format", () => {
-      // This is a white-box test of the internal parsing logic
-      const mockResponse = `"script1" ACTIVE
-"script2"
-OK Listscripts completed.`;
-
-      // Expected output: [
-      //   { name: "script1", content: "", active: true },
-      //   { name: "script2", content: "", active: false }
-      // ]
-
-      // Since parseScriptList is private, we test it indirectly through the public API
-      // This test validates our understanding of the response format
-      expect(mockResponse).toContain("ACTIVE");
-      expect(mockResponse).toContain("OK");
-    });
+  it("terminates on OK/NO/BYE past the whole line", () => {
+    expect(findResponseEnd(b("OK\r\n"))).toBe(4);
+    expect(findResponseEnd(b("NO err\r\n"))).toBe(8);
   });
 
-  describe("parseCapabilities", () => {
-    it("should understand capability response format", () => {
-      const mockCapabilities = `"IMPLEMENTATION" "Dovecot Pigeonhole"
-"VERSION" "1.0"
-"SASL" "PLAIN LOGIN"
-"SIEVE" "fileinto envelope body"
-"STARTTLS"
-OK Capability completed.`;
-
-      // Expected parsing:
-      // - implementation: "Dovecot Pigeonhole"
-      // - version: "1.0"
-      // - saslMechanisms: ["PLAIN", "LOGIN"]
-      // - sieveExtensions: ["fileinto", "envelope", "body", "STARTTLS"]
-
-      expect(mockCapabilities).toContain("IMPLEMENTATION");
-      expect(mockCapabilities).toContain("SASL");
-      expect(mockCapabilities).toContain("SIEVE");
-    });
+  it("does not treat a literal body as a terminator", () => {
+    const body = "NO everywhere\r\n";
+    const buf = b(`{${Buffer.byteLength(body)}}\r\n${body}OK\r\n`);
+    expect(findResponseEnd(buf)).toBe(buf.length);
   });
 
-  describe("error handling", () => {
-    it("should require connection before authentication", async () => {
-      await expect(sieveService.authenticate()).rejects.toThrow(
-        "Not connected to server",
-      );
-    });
-
-    it("should require authentication before operations", async () => {
-      // ensureAuthenticated should connect and authenticate if needed
-      // But without a real connection, operations should fail gracefully
-      await expect(sieveService.listScripts()).rejects.toThrow();
-    });
+  it("counts literal length in OCTETS, not UTF-16 units", () => {
+    // "grüße" is 5 code units but 7 UTF-8 octets. A char-based skip would land
+    // mid-response and mis-detect the terminator.
+    const body = "grüße\r\n";
+    const octets = Buffer.byteLength(body, "utf8");
+    const buf = b(`{${octets}}\r\n${body}OK\r\n`);
+    expect(findResponseEnd(buf)).toBe(buf.length);
   });
 
-  describe("Sieve script examples", () => {
-    it("should validate newsletter filter script format", () => {
-      const newsletterFilter = `require ["fileinto"];
+  it("leaves the next response untouched", () => {
+    const first = "OK one\r\n";
+    expect(findResponseEnd(b(`${first}leftover`))).toBe(first.length);
+  });
+});
 
-if header :contains "From" [
-  "correctiv.org",
-  "krautreporter.de",
-  "substack.com"
-] {
-  fileinto "Newsletter";
-  stop;
-}`;
-
-      expect(newsletterFilter).toContain('require ["fileinto"]');
-      expect(newsletterFilter).toContain("header :contains");
-      expect(newsletterFilter).toContain("stop");
-    });
-
-    it("should validate transactional email filter format", () => {
-      const transactionalFilter = `require ["fileinto"];
-
-if anyof (
-  header :contains "From" ["paypal.de", "stripe.com"],
-  header :contains "Subject" ["Order", "Receipt", "Invoice"]
-) {
-  fileinto "Transactional";
-  stop;
-}`;
-
-      expect(transactionalFilter).toContain("anyof");
-      expect(transactionalFilter).toContain("fileinto");
-      expect(transactionalFilter).toContain("Transactional");
-    });
-
-    it("should validate banking filter format", () => {
-      const bankingFilter = `require ["fileinto"];
-
-if header :contains "From" [
-  "deutsche-bank.de",
-  "revolut.com",
-  "tomorrow.one"
-] {
-  fileinto "Banking";
-  stop;
-}`;
-
-      expect(bankingFilter).toContain("Banking");
-      expect(bankingFilter).toContain("header :contains");
-    });
+describe("extractScriptContent (byte-accurate)", () => {
+  it("extracts exactly n octets, umlauts intact", () => {
+    const body = 'require ["fileinto"];\r\n# Spätzle & Grüße\r\nfileinto "Müll";\r\n';
+    const octets = Buffer.byteLength(body, "utf8");
+    const res = b(`{${octets}}\r\n${body}\r\nOK\r\n`);
+    expect(extractScriptContent(res)).toBe(body);
   });
 
-  describe("connection state management", () => {
-    it("should track connection state", () => {
-      expect(sieveService.isConnected()).toBe(false);
-
-      // After successful connection, isConnected() should return true
-      // This would be tested in real integration tests
-    });
-
-    it("should track authentication state", () => {
-      expect(sieveService.isAuthenticated()).toBe(false);
-
-      // After successful authentication, isAuthenticated() should return true
-      // This would be tested in real integration tests
-    });
-
-    it("should reset state on disconnect", async () => {
-      await sieveService.disconnect();
-
-      expect(sieveService.isConnected()).toBe(false);
-      expect(sieveService.isAuthenticated()).toBe(false);
-      expect(sieveService.getServerCapabilities()).toBeNull();
-    });
+  it("handles a body that itself contains an OK line", () => {
+    const body = "# OK this looks like a terminator\r\nkeep;\r\n";
+    const octets = Buffer.byteLength(body, "utf8");
+    const res = b(`{${octets}}\r\n${body}\r\nOK\r\n`);
+    expect(extractScriptContent(res)).toBe(body);
   });
 
-  describe("ManageSieve protocol", () => {
-    it("should follow RFC 5804 protocol basics", () => {
-      // ManageSieve protocol uses:
-      // - CAPABILITY command to get server capabilities
-      // - AUTHENTICATE for authentication (supports PLAIN, LOGIN, etc.)
-      // - LISTSCRIPTS to list available scripts
-      // - GETSCRIPT to retrieve script content
-      // - PUTSCRIPT to upload/update scripts
-      // - SETACTIVE to activate a script
-      // - DELETESCRIPT to delete scripts
-      // - CHECKSCRIPT to validate script syntax
-      // - LOGOUT to end session
+  it("returns undefined without a literal", () => {
+    expect(extractScriptContent(b('OK "empty"\r\n'))).toBeUndefined();
+  });
+});
 
-      const commands = [
-        "CAPABILITY",
-        "AUTHENTICATE",
-        "LISTSCRIPTS",
-        "GETSCRIPT",
-        "PUTSCRIPT",
-        "SETACTIVE",
-        "DELETESCRIPT",
-        "CHECKSCRIPT",
-        "LOGOUT",
-      ];
-
-      // Verify we understand the protocol command set
-      expect(commands).toHaveLength(9);
-      expect(commands).toContain("CAPABILITY");
-      expect(commands).toContain("AUTHENTICATE");
-    });
-
-    it("should use PLAIN SASL mechanism format", () => {
-      const username = "test@mailbox.org";
-      const password = "test-password";
-      const authString = `\0${username}\0${password}`;
-      const authBase64 = Buffer.from(authString).toString("base64");
-
-      // PLAIN SASL format: \0username\0password (base64 encoded)
-      expect(authBase64).toBeTruthy();
-      expect(authString).toContain("\0");
-    });
+describe("parseListScripts", () => {
+  it("parses names and the ACTIVE flag", () => {
+    const res = '"Open-Xchange" ACTIVE\r\n"claude-filter"\r\nOK\r\n';
+    expect(parseListScripts(res)).toEqual([
+      { name: "Open-Xchange", content: "", active: true },
+      { name: "claude-filter", content: "", active: false },
+    ]);
   });
 
-  describe("edge cases", () => {
-    it("should handle multiple connects gracefully", async () => {
-      // Second connect should be a no-op if already connected
-      // This prevents connection leaks
-    });
+  it("returns an empty list when there are none", () => {
+    expect(parseListScripts('OK "no scripts"\r\n')).toEqual([]);
+  });
+});
 
-    it("should handle disconnect when not connected", async () => {
-      await expect(sieveService.disconnect()).resolves.not.toThrow();
-    });
+describe("SieveService handshake + TLS gate", () => {
+  it("upgrades via STARTTLS before authenticating", async () => {
+    const t = new FakeTransport([
+      ...handshake(),
+      b('"Open-Xchange" ACTIVE\r\nOK\r\n'),
+    ]);
+    const service = new SieveService(config, () => t);
 
-    it("should handle empty script list", () => {
-      const emptyResponse = "OK Listscripts completed.";
-      expect(emptyResponse).toContain("OK");
-    });
+    const scripts = await service.listScripts();
 
-    it("should handle scripts with special characters", () => {
-      const specialScript = `require ["fileinto"];
-
-# German umlauts and special characters
-if header :contains "From" "müller@example.de" {
-  fileinto "Spëcial";
-  stop;
-}`;
-
-      expect(specialScript).toContain("müller");
-      expect(specialScript).toContain("Spëcial");
-    });
+    expect(scripts).toEqual([
+      { name: "Open-Xchange", content: "", active: true },
+    ]);
+    const text = t.writtenText();
+    expect(text).toContain("STARTTLS\r\n");
+    expect(text.indexOf("STARTTLS")).toBeLessThan(text.indexOf("AUTHENTICATE"));
+    expect(text).toContain('AUTHENTICATE "PLAIN"');
   });
 
-  describe("parseScriptList - branch coverage", () => {
-    let testableService: TestableSieveService;
+  it("refuses to authenticate when the channel cannot be encrypted", async () => {
+    // Greeting without STARTTLS, transport stays insecure.
+    const t = new FakeTransport([
+      b('"IMPLEMENTATION" "Dovecot"\r\n"SIEVE" "fileinto"\r\nOK\r\n'),
+    ]);
+    const service = new SieveService(config, () => t);
 
-    beforeEach(() => {
-      testableService = new TestableSieveService(mockConfig);
-    });
+    await expect(service.listScripts()).rejects.toThrow(/not encrypted/i);
+    expect(t.writtenText()).not.toContain("AUTHENTICATE");
+  });
 
-    it.each([
-      [
-        "quoted script with ACTIVE",
-        '"script1" ACTIVE\r\nOK',
-        [{ name: "script1", content: "", active: true }],
-      ],
-      [
-        "quoted script without ACTIVE",
-        '"script2"\r\nOK',
-        [{ name: "script2", content: "", active: false }],
-      ],
-      [
-        "multiple quoted scripts",
-        '"script1" ACTIVE\r\n"script2"\r\n"script3" ACTIVE\r\nOK',
-        [
-          { name: "script1", content: "", active: true },
-          { name: "script2", content: "", active: false },
-          { name: "script3", content: "", active: true },
-        ],
-      ],
-    ])(
-      "should parse %s",
-      (_description: string, input: string, expected: SieveScript[]) => {
-        const result = testableService.testParseScriptList(input);
-        expect(result).toEqual(expected);
-      },
+  it("skips STARTTLS when the channel is already secure", async () => {
+    const t = new FakeTransport(
+      [b('"IMPLEMENTATION" "Dovecot"\r\n"SIEVE" "fileinto"\r\nOK\r\n'), AUTH_OK, b("OK\r\n")],
+      true, // implicit TLS
     );
+    const service = new SieveService({ ...config, secure: true }, () => t);
 
-    it.each([
-      [
-        "unquoted script with ACTIVE",
-        "script1 ACTIVE\r\nOK",
-        [{ name: "script1", content: "", active: true }],
-      ],
-      [
-        "unquoted script without ACTIVE",
-        "script2\r\nOK",
-        [{ name: "script2", content: "", active: false }],
-      ],
-      [
-        "mixed quoted and unquoted",
-        '"quoted" ACTIVE\r\nunquoted\r\nOK',
-        [
-          { name: "quoted", content: "", active: true },
-          { name: "unquoted", content: "", active: false },
-        ],
-      ],
-    ])(
-      "should parse %s",
-      (_description: string, input: string, expected: SieveScript[]) => {
-        const result = testableService.testParseScriptList(input);
-        expect(result).toEqual(expected);
-      },
-    );
+    await service.listScripts();
+    expect(t.writtenText()).not.toContain("STARTTLS");
+    expect(t.writtenText()).toContain("AUTHENTICATE");
+  });
+});
 
-    it("should handle ACTIVE on separate line as script name", () => {
-      // Note: The parser treats "ACTIVE" on its own line as a script name
-      // This is the current behavior - ACTIVE must be on same line as script name
-      const input = "script1\r\nACTIVE\r\nOK";
-      const result = testableService.testParseScriptList(input);
+describe("SieveService script operations", () => {
+  it("getScript returns the literal body byte-for-byte", async () => {
+    const body = 'require ["fileinto"];\r\nfileinto "Grüße";\r\n';
+    const octets = Buffer.byteLength(body, "utf8");
+    const t = new FakeTransport([
+      ...handshake(),
+      b(`{${octets}}\r\n${body}\r\nOK\r\n`),
+    ]);
+    const service = new SieveService(config, () => t);
 
-      // Parser creates two scripts: "script1" and "ACTIVE"
-      expect(result.length).toBe(2);
-      expect(result[0].name).toBe("script1");
-      expect(result[1].name).toBe("ACTIVE");
-      // The second-pass marks the last script (ACTIVE) as active
-      expect(result[1].active).toBe(true);
-    });
-
-    it.each([
-      ["empty response", "OK", []],
-      ["only OK line", "OK Listscripts completed\r\n", []],
-      ["only NO line", "NO Failed\r\n", []],
-      ["whitespace lines", "\r\n\r\n\r\nOK", []],
-    ])(
-      "should handle %s",
-      (_description: string, input: string, expected: SieveScript[]) => {
-        const result = testableService.testParseScriptList(input);
-        expect(result).toEqual(expected);
-      },
-    );
-
-    it("should skip lines starting with OK or NO", () => {
-      // OK and NO lines are status responses, not script names
-      const input = '"script1"\r\nOK Some text\r\n"script2"\r\n';
-      const result = testableService.testParseScriptList(input);
-
-      // Both scripts are parsed (OK line is skipped)
-      expect(result.length).toBe(2);
-      expect(result[0].name).toBe("script1");
-      expect(result[1].name).toBe("script2");
-    });
+    expect(await service.getScript("Open-Xchange")).toBe(body);
   });
 
-  describe("parseCapabilities - branch coverage", () => {
-    let testableService: TestableSieveService;
+  it("getScript throws on a NO response", async () => {
+    const t = new FakeTransport([
+      ...handshake(),
+      b('NO "script does not exist"\r\n'),
+    ]);
+    const service = new SieveService(config, () => t);
 
-    beforeEach(() => {
-      testableService = new TestableSieveService(mockConfig);
-    });
+    await expect(service.getScript("missing")).rejects.toThrow(/get script/i);
+  });
 
-    it.each([
-      [
-        "quoted IMPLEMENTATION",
-        '"IMPLEMENTATION" "Dovecot Pigeonhole"\r\nOK',
-        {
-          implementation: "Dovecot Pigeonhole",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "quoted VERSION",
-        '"VERSION" "1.0"\r\nOK',
-        {
-          implementation: "",
-          version: "1.0",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "quoted SASL",
-        '"SASL" "PLAIN LOGIN"\r\nOK',
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: ["PLAIN", "LOGIN"],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "quoted SIEVE",
-        '"SIEVE" "fileinto envelope body"\r\nOK',
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: ["fileinto", "envelope", "body"],
-        },
-      ],
-      [
-        "quoted STARTTLS",
-        '"STARTTLS"\r\nOK',
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: ["STARTTLS"],
-        },
-      ],
-    ])(
-      "should parse %s",
-      (_description: string, input: string, expected: SieveCapabilities) => {
-        const result = testableService.testParseCapabilities(input);
-        expect(result).toEqual(expected);
-      },
-    );
+  it("putScript sends a non-synchronising literal with the OCTET length", async () => {
+    const content = 'require ["fileinto"];\r\nfileinto "Müll";\r\n'; // has umlaut
+    const octets = Buffer.byteLength(content, "utf8");
+    const t = new FakeTransport([...handshake(), b('OK "putscript"\r\n')]);
+    const service = new SieveService(config, () => t);
 
-    it.each([
-      [
-        "unquoted IMPLEMENTATION",
-        'IMPLEMENTATION "Dovecot"\r\nOK',
-        {
-          implementation: "Dovecot",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "unquoted VERSION",
-        'VERSION "2.0"\r\nOK',
-        {
-          implementation: "",
-          version: "2.0",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "unquoted SASL",
-        'SASL "PLAIN"\r\nOK',
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: ["PLAIN"],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "unquoted SIEVE",
-        'SIEVE "fileinto"\r\nOK',
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: ["fileinto"],
-        },
-      ],
-      [
-        "unquoted STARTTLS",
-        "STARTTLS\r\nOK",
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: ["STARTTLS"],
-        },
-      ],
-    ])(
-      "should parse %s",
-      (_description: string, input: string, expected: SieveCapabilities) => {
-        const result = testableService.testParseCapabilities(input);
-        expect(result).toEqual(expected);
-      },
-    );
+    await service.putScript("test", content);
 
-    it.each([
-      [
-        "complete quoted capabilities",
-        '"IMPLEMENTATION" "Dovecot Pigeonhole"\r\n"VERSION" "1.0"\r\n"SASL" "PLAIN LOGIN"\r\n"SIEVE" "fileinto envelope"\r\n"STARTTLS"\r\nOK',
-        {
-          implementation: "Dovecot Pigeonhole",
-          version: "1.0",
-          saslMechanisms: ["PLAIN", "LOGIN"],
-          sieveExtensions: ["fileinto", "envelope", "STARTTLS"],
-        },
-      ],
-      [
-        "complete unquoted capabilities",
-        'IMPLEMENTATION "Cyrus"\r\nVERSION "2.0"\r\nSASL "PLAIN"\r\nSIEVE "fileinto"\r\nSTARTTLS\r\nOK',
-        {
-          implementation: "Cyrus",
-          version: "2.0",
-          saslMechanisms: ["PLAIN"],
-          sieveExtensions: ["fileinto", "STARTTLS"],
-        },
-      ],
-      [
-        "mixed quoted and unquoted",
-        '"IMPLEMENTATION" "Dovecot"\r\nVERSION "1.0"\r\n"SASL" "PLAIN"\r\nSIEVE "fileinto"\r\nOK',
-        {
-          implementation: "Dovecot",
-          version: "1.0",
-          saslMechanisms: ["PLAIN"],
-          sieveExtensions: ["fileinto"],
-        },
-      ],
-    ])(
-      "should parse %s",
-      (_description: string, input: string, expected: SieveCapabilities) => {
-        const result = testableService.testParseCapabilities(input);
-        expect(result).toEqual(expected);
-      },
-    );
+    const text = t.writtenText();
+    expect(text).toContain(`PUTSCRIPT "test" {${octets}+}\r\n`);
+    expect(text).toContain(content);
+    // The octet count must exceed the JS string length for umlaut content.
+    expect(octets).toBeGreaterThan(content.length);
+  });
 
-    it.each([
-      [
-        "empty response",
-        "OK",
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "whitespace lines",
-        "\r\n\r\n\r\nOK",
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-      [
-        "unknown capability line",
-        "UNKNOWN_CAP value\r\nOK",
-        {
-          implementation: "",
-          version: "",
-          saslMechanisms: [],
-          sieveExtensions: [],
-        },
-      ],
-    ])(
-      "should handle %s",
-      (_description: string, input: string, expected: SieveCapabilities) => {
-        const result = testableService.testParseCapabilities(input);
-        expect(result).toEqual(expected);
-      },
-    );
+  it("checkScript sends CHECKSCRIPT with an octet literal", async () => {
+    const content = "keep;\r\n";
+    const octets = Buffer.byteLength(content, "utf8");
+    const t = new FakeTransport([...handshake(), b("OK\r\n")]);
+    const service = new SieveService(config, () => t);
+
+    await service.checkScript(content);
+    expect(t.writtenText()).toContain(`CHECKSCRIPT {${octets}+}\r\n`);
+  });
+
+  it("setActiveScript reports a NO as an error", async () => {
+    const t = new FakeTransport([...handshake(), b('NO "no such script"\r\n')]);
+    const service = new SieveService(config, () => t);
+
+    await expect(service.setActiveScript("nope")).rejects.toThrow(/activate/i);
+  });
+
+  it("parses capabilities from the greeting", async () => {
+    const t = new FakeTransport(handshake());
+    const service = new SieveService(config, () => t);
+    await service.connect();
+    await service.authenticate();
+
+    const caps = service.getServerCapabilities();
+    expect(caps?.implementation).toBe("Dovecot Pigeonhole");
+    expect(caps?.sieveExtensions).toContain("fileinto");
   });
 });
