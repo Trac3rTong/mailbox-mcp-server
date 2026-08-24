@@ -43,11 +43,13 @@ describe("Calendar Tools", () => {
     it("should create all calendar tools", () => {
       const tools = createCalendarTools(mockCalendarService as CalendarService);
 
-      expect(tools).toHaveLength(3);
       expect(tools.map(t => t.name)).toEqual([
         "get_calendar_events",
         "search_calendar",
         "get_free_busy",
+        "create_event",
+        "update_event",
+        "delete_event",
       ]);
     });
 

@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { CalendarService } from "../src/services/CalendarService.js";
 import type { EmailService } from "../src/services/EmailService.js";
 import type { SmtpService } from "../src/services/SmtpService.js";
-import { createCalendarTools } from "../src/tools/calendarTools.js";
+import {
+  CALENDAR_TOOLS,
+  createCalendarTools,
+  isCalendarTool,
+} from "../src/tools/calendarTools.js";
 import { createEmailTools } from "../src/tools/emailTools.js";
 
 describe("main.ts module structure and logic", () => {
@@ -342,22 +346,17 @@ describe("main.ts module structure and logic", () => {
         tool => tool.name,
       );
 
-      // Simulate the server's isCalendarTool function
-      const isCalendarTool = (toolName: string): boolean => {
-        return [
-          "get_calendar_events",
-          "search_calendar",
-          "get_free_busy",
-        ].includes(toolName);
-      };
-
-      // Check that every implemented tool is registered in routing logic
+      // Use the REAL routing predicate. This test used to inline a copy of the
+      // tool list and check it against itself, so it could never detect the
+      // drift it exists to catch: a tool offered to the model but not routed.
       for (const toolName of implementedCalendarToolNames) {
         expect(isCalendarTool(toolName)).toBe(true);
       }
 
-      // Verify we have the expected number of tools
-      expect(implementedCalendarToolNames).toHaveLength(3);
+      // And the reverse direction: nothing routable is missing from the offer.
+      for (const routed of CALENDAR_TOOLS) {
+        expect(implementedCalendarToolNames).toContain(routed);
+      }
     });
   });
 });

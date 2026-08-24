@@ -352,6 +352,52 @@ export const getFreeBusySchema = v.pipe(
   ),
 );
 
+/** Shared shape for creating and updating an event. */
+const eventBodySchema = {
+  summary: v.pipe(v.string(), v.minLength(1), v.maxLength(500)),
+  start: dateSchema,
+  end: dateSchema,
+  allDay: v.optional(v.boolean(), false),
+  description: v.optional(v.pipe(v.string(), v.maxLength(10000))),
+  location: v.optional(v.pipe(v.string(), v.maxLength(500))),
+  transparent: v.optional(v.boolean(), false),
+  categories: v.optional(v.array(v.pipe(v.string(), v.maxLength(100)))),
+};
+
+// An all-day event legitimately has start === end in some clients, so the rule
+// is "end is not BEFORE start" rather than a strict ordering.
+const END_NOT_BEFORE_START = "End date must not be before start date";
+
+export const createEventSchema = v.pipe(
+  v.object({
+    ...eventBodySchema,
+    calendar: v.optional(calendarNameSchema),
+  }),
+  v.check(
+    data => new Date(data.end) >= new Date(data.start),
+    END_NOT_BEFORE_START,
+  ),
+);
+
+export const updateEventSchema = v.pipe(
+  v.object({
+    ...eventBodySchema,
+    url: v.pipe(v.string(), v.minLength(1), v.maxLength(2000)),
+    // Optional, but leaving it out disables the concurrency check and allows a
+    // change made elsewhere to be overwritten without warning.
+    etag: v.optional(v.pipe(v.string(), v.maxLength(200))),
+  }),
+  v.check(
+    data => new Date(data.end) >= new Date(data.start),
+    END_NOT_BEFORE_START,
+  ),
+);
+
+export const deleteEventSchema = v.object({
+  url: v.pipe(v.string(), v.minLength(1), v.maxLength(2000)),
+  etag: v.optional(v.pipe(v.string(), v.maxLength(200))),
+});
+
 // =============================================================================
 // SCHEMA TYPE EXPORTS
 // =============================================================================
@@ -371,6 +417,9 @@ export type GetCalendarEventsInput = v.InferOutput<
 >;
 export type SearchCalendarInput = v.InferOutput<typeof searchCalendarSchema>;
 export type GetFreeBusyInput = v.InferOutput<typeof getFreeBusySchema>;
+export type CreateEventInput = v.InferOutput<typeof createEventSchema>;
+export type UpdateEventInput = v.InferOutput<typeof updateEventSchema>;
+export type DeleteEventInput = v.InferOutput<typeof deleteEventSchema>;
 
 // =============================================================================
 // VALIDATION UTILITIES

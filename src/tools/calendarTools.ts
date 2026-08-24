@@ -9,17 +9,59 @@ import {
   ValidationError,
 } from "../types/errors.js";
 import {
+  createEventSchema,
+  deleteEventSchema,
   getCalendarEventsSchema,
   getFreeBusySchema,
   searchCalendarSchema,
+  updateEventSchema,
   validateInput,
 } from "../validation/schemas.js";
+
+/** Field descriptions shared by create_event and update_event. */
+const EVENT_BODY_PROPERTIES = {
+  summary: {
+    type: "string",
+    description: "Title of the event",
+  },
+  start: {
+    type: "string",
+    format: "date-time",
+    description: "Start of the event (ISO 8601)",
+  },
+  end: {
+    type: "string",
+    format: "date-time",
+    description: "End of the event (ISO 8601)",
+  },
+  allDay: {
+    type: "boolean",
+    description: "All-day event (dates instead of times)",
+    default: false,
+  },
+  description: { type: "string", description: "Longer description" },
+  location: { type: "string", description: "Location" },
+  transparent: {
+    type: "boolean",
+    description:
+      "Mark as not blocking time, so it does not count as busy in free/busy",
+    default: false,
+  },
+  categories: {
+    type: "array",
+    items: { type: "string" },
+    description: "Category labels",
+  },
+} as const;
 
 /** Calendar tool names - exported for tool routing */
 export const CALENDAR_TOOLS = [
   "get_calendar_events",
   "search_calendar",
   "get_free_busy",
+  "create_event",
+  "update_event",
+  "delete_event",
 ] as const;
 
 export type CalendarToolName = (typeof CALENDAR_TOOLS)[number];
@@ -143,6 +185,66 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
         additionalProperties: false,
       },
     },
+    {
+      name: "create_event",
+      description:
+        "Create a new event in a mailbox.org calendar. Returns the url and etag of the new event; both are needed to change or delete it later.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ...EVENT_BODY_PROPERTIES,
+          calendar: {
+            type: "string",
+            description:
+              "Calendar to create the event in (optional, uses the first calendar if omitted)",
+          },
+        },
+        required: ["summary", "start", "end"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "update_event",
+      description:
+        "Replace an existing event. Takes the url from get_calendar_events. Pass the etag as well so the write is refused if the event was changed elsewhere in the meantime; without it such a change is overwritten silently. All fields are replaced, so send the complete event, not only what changed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ...EVENT_BODY_PROPERTIES,
+          url: {
+            type: "string",
+            description: "URL of the CalDAV resource, from get_calendar_events",
+          },
+          etag: {
+            type: "string",
+            description:
+              "ETag from get_calendar_events. Strongly recommended: it turns the write into a conditional request.",
+          },
+        },
+        required: ["url", "summary", "start", "end"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "delete_event",
+      description:
+        "Delete an event by its CalDAV url. Pass the etag so the deletion is refused if the event changed since it was read.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "URL of the CalDAV resource, from get_calendar_events",
+          },
+          etag: {
+            type: "string",
+            description: "ETag from get_calendar_events (recommended)",
+          },
+        },
+        required: ["url"],
+        additionalProperties: false,
+      },
+    },
   ];
 }
 
@@ -189,7 +291,19 @@ ${event.location ? `Location: ${event.location}\n` : ""}${
 }Calendar: ${event.calendar}
 ${
   event.attendees?.length ? `Attendees: ${event.attendees.length}\n` : ""
-}${event.recurring ? "Recurring: Yes\n" : ""}`,
+}${
+  event.recurring
+    ? `Recurring: Yes${event.isException ? " (this occurrence was moved or edited)" : ""}\n`
+    : ""
+}${event.transparent ? "Blocks time: no (marked transparent)\n" : ""}${
+  event.url
+    ? `url: ${event.url}\netag: ${event.etag ?? "(none)"}${
+        event.recurring
+          ? "\nNote: this url addresses the WHOLE series. Editing it changes every occurrence."
+          : ""
+      }\n`
+    : ""
+}`,
                 )
                 .join("\n---\n")}`,
             },
@@ -273,6 +387,87 @@ ${busySlots.length > 0 ? busySlots.join("\n") : "No busy times"}
 
 **Free Times (${freeBusy.free.length}):**
 ${freeSlots.length > 0 ? freeSlots.join("\n") : "No free times"}`,
+            },
+          ],
+        };
+      }
+
+      case "create_event": {
+        const a = validateInput(createEventSchema, args);
+        const result = await calendarService.createEvent(
+          {
+            summary: a.summary,
+            start: new Date(a.start),
+            end: new Date(a.end),
+            allDay: a.allDay,
+            description: a.description,
+            location: a.location,
+            transparent: a.transparent,
+            categories: a.categories,
+          },
+          a.calendar,
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ ${result.message}
+
+**${a.summary}**
+${dayjs(a.start).format("YYYY-MM-DD HH:mm")} - ${dayjs(a.end).format("YYYY-MM-DD HH:mm")}${a.location ? `\nLocation: ${a.location}` : ""}
+
+Keep these to change or delete the event later:
+- url: ${result.url}
+- etag: ${result.etag ?? "(not returned by the server; re-read the event before changing it)"}`,
+            },
+          ],
+        };
+      }
+
+      case "update_event": {
+        const a = validateInput(updateEventSchema, args);
+        const result = await calendarService.updateEvent(
+          a.url,
+          {
+            summary: a.summary,
+            start: new Date(a.start),
+            end: new Date(a.end),
+            allDay: a.allDay,
+            description: a.description,
+            location: a.location,
+            transparent: a.transparent,
+            categories: a.categories,
+          },
+          a.etag,
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ ${result.message}
+
+**${a.summary}**
+${dayjs(a.start).format("YYYY-MM-DD HH:mm")} - ${dayjs(a.end).format("YYYY-MM-DD HH:mm")}${a.location ? `\nLocation: ${a.location}` : ""}
+${a.etag ? "" : "\n⚠️ Sent without an etag: a change made elsewhere since you read this event has just been overwritten without warning."}
+- url: ${result.url}
+- etag: ${result.etag ?? "(not returned; re-read the event before the next change)"}`,
+            },
+          ],
+        };
+      }
+
+      case "delete_event": {
+        const a = validateInput(deleteEventSchema, args);
+        const result = await calendarService.deleteEvent(a.url, a.etag);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ ${result.message}
+- url: ${a.url}${a.etag ? "" : "\n⚠️ Deleted without an etag: no check was made for changes since you read this event."}`,
             },
           ],
         };

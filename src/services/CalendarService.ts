@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import dayjs from "dayjs";
 import ICAL from "ical.js";
 import { createDAVClient, type DAVCalendar, type DAVObject } from "tsdav";
@@ -8,8 +9,15 @@ import type {
   CalendarEvent,
   CalendarSearchOptions,
   FreeBusyInfo,
+  CalendarEventInput,
+  CalendarWriteResult,
 } from "../types/calendar.types.js";
-import { classifyTransportError } from "../types/errors.js";
+import {
+  CalendarError,
+  classifyTransportError,
+  ErrorCode,
+  ValidationError,
+} from "../types/errors.js";
 import { withCacheFallback } from "../utils/cacheFallback.js";
 import {
   CircuitBreaker,
@@ -776,6 +784,214 @@ export class CalendarService {
     }
 
     return { start, end, busy, free };
+  }
+
+  // ---------------------------------------------------------------------
+  // Writing
+  //
+  // tsdav reports a refusal by resolving with a fetch Response whose ok is
+  // false, not by throwing. Every write below therefore inspects the response;
+  // ignoring it is precisely how the read path came to report success for
+  // operations that never happened.
+  // ---------------------------------------------------------------------
+
+  private async resolveCalendar(name?: string): Promise<DAVCalendar> {
+    const client = await this.getClient();
+    const calendars = await client.fetchCalendars();
+
+    if (calendars.length === 0) {
+      throw new CalendarError(
+        "The account exposes no writable calendar",
+        ErrorCode.CALENDAR_NOT_FOUND,
+      );
+    }
+
+    if (!name) return calendars[0];
+
+    const match = calendars.find(
+      cal => (cal.displayName as string) === name || cal.url.includes(name),
+    );
+    if (!match) {
+      const bekannt = calendars
+        .map(cal => (cal.displayName as string) || cal.url)
+        .join(", ");
+      throw new CalendarError(
+        `No calendar named '${name}'. Available: ${bekannt}`,
+        ErrorCode.CALENDAR_NOT_FOUND,
+      );
+    }
+    return match;
+  }
+
+  /** Builds the iCalendar text via ical.js so values are escaped properly. */
+  private buildICalendar(input: CalendarEventInput, uid: string): string {
+    const calendar = new ICAL.Component(["vcalendar", [], []]);
+    calendar.updatePropertyWithValue("version", "2.0");
+    calendar.updatePropertyWithValue("prodid", "-//mailbox-mcp-server//EN");
+
+    const vevent = new ICAL.Component("vevent");
+    const event = new ICAL.Event(vevent);
+
+    event.uid = uid;
+    event.summary = input.summary;
+    if (input.description) event.description = input.description;
+    if (input.location) event.location = input.location;
+
+    const start = ICAL.Time.fromJSDate(input.start, true);
+    const end = ICAL.Time.fromJSDate(input.end, true);
+    if (input.allDay) {
+      start.isDate = true;
+      end.isDate = true;
+    }
+    event.startDate = start;
+    event.endDate = end;
+
+    const now = ICAL.Time.fromJSDate(new Date(), true);
+    vevent.updatePropertyWithValue("dtstamp", now);
+    vevent.updatePropertyWithValue("created", now);
+    vevent.updatePropertyWithValue("last-modified", now);
+
+    if (input.transparent) {
+      vevent.updatePropertyWithValue("transp", "TRANSPARENT");
+    }
+    if (input.categories?.length) {
+      vevent.updatePropertyWithValue("categories", input.categories.join(","));
+    }
+
+    calendar.addSubcomponent(vevent);
+    return calendar.toString();
+  }
+
+  private assertWriteAccepted(
+    response: { ok?: boolean; status?: number; statusText?: string },
+    operation: string,
+  ): void {
+    if (response?.ok) return;
+    throw new CalendarError(
+      `${operation} was refused by the server (HTTP ${response?.status ?? "?"} ${
+        response?.statusText ?? ""
+      })`.trim(),
+      ErrorCode.OPERATION_FAILED,
+    );
+  }
+
+  /** Any write invalidates the cached reads; otherwise the change stays hidden. */
+  private invalidateCalendarCache(): void {
+    this.cache.clear();
+  }
+
+  async createEvent(
+    input: CalendarEventInput,
+    calendarName?: string,
+  ): Promise<CalendarWriteResult> {
+    if (input.end < input.start) {
+      throw new ValidationError(
+        "The event ends before it starts",
+        "end",
+        input.end,
+      );
+    }
+
+    const client = await this.getClient();
+    const calendar = await this.resolveCalendar(calendarName);
+    const uid = `${randomUUID()}@mailbox-mcp-server`;
+    const filename = `${uid}.ics`;
+
+    const response = await client.createCalendarObject({
+      calendar,
+      filename,
+      iCalString: this.buildICalendar(input, uid),
+    });
+    this.assertWriteAccepted(response, "Creating the event");
+
+    this.invalidateCalendarCache();
+
+    const url = `${calendar.url.replace(/\/?$/, "/")}${filename}`;
+    return {
+      success: true,
+      message: `Event '${input.summary}' created in '${
+        (calendar.displayName as string) || calendar.url
+      }'`,
+      uid,
+      url,
+      etag: response.headers?.get?.("etag") ?? undefined,
+    };
+  }
+
+  /**
+   * Replaces the event at `url`.
+   *
+   * `etag` is optional but strongly recommended: passing the one that came with
+   * the event turns the write into a conditional request, so a change made on
+   * another device in the meantime causes a refusal instead of being silently
+   * overwritten.
+   */
+  async updateEvent(
+    url: string,
+    input: CalendarEventInput,
+    etag?: string,
+  ): Promise<CalendarWriteResult> {
+    if (input.end < input.start) {
+      throw new ValidationError(
+        "The event ends before it starts",
+        "end",
+        input.end,
+      );
+    }
+
+    const client = await this.getClient();
+    const uid = this.uidFromUrl(url);
+
+    const response = await client.updateCalendarObject({
+      calendarObject: {
+        url,
+        data: this.buildICalendar(input, uid),
+        etag,
+      },
+    });
+
+    if (response?.status === 412) {
+      throw new CalendarError(
+        "The event was changed elsewhere since it was read. Fetch it again and reapply the change.",
+        ErrorCode.CALENDAR_CONFLICT,
+      );
+    }
+    this.assertWriteAccepted(response, "Updating the event");
+
+    this.invalidateCalendarCache();
+
+    return {
+      success: true,
+      message: `Event '${input.summary}' updated`,
+      uid,
+      url,
+      etag: response.headers?.get?.("etag") ?? undefined,
+    };
+  }
+
+  async deleteEvent(url: string, etag?: string): Promise<CalendarWriteResult> {
+    const client = await this.getClient();
+
+    const response = await client.deleteCalendarObject({
+      calendarObject: { url, etag },
+    });
+
+    if (response?.status === 412) {
+      throw new CalendarError(
+        "The event was changed elsewhere since it was read. Fetch it again before deleting.",
+        ErrorCode.CALENDAR_CONFLICT,
+      );
+    }
+    this.assertWriteAccepted(response, "Deleting the event");
+
+    this.invalidateCalendarCache();
+
+    return { success: true, message: "Event deleted", url };
+  }
+
+  private uidFromUrl(url: string): string {
+    const last = url.split("/").pop() ?? "";
+    return decodeURIComponent(last.replace(/\.ics$/i, "")) || randomUUID();
   }
 
   // Get circuit breaker metrics

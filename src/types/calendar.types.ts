@@ -49,6 +49,28 @@ export interface CalendarEvent {
   modified: Date;
 }
 
+/** Fields accepted when creating or changing an event. */
+export interface CalendarEventInput {
+  summary: string;
+  start: Date;
+  end: Date;
+  allDay?: boolean;
+  description?: string;
+  location?: string;
+  /** Marks the entry as not blocking time (TRANSP:TRANSPARENT). */
+  transparent?: boolean;
+  categories?: string[];
+}
+
+/** What a write returned, including the identity needed for the next change. */
+export interface CalendarWriteResult {
+  success: boolean;
+  message: string;
+  uid?: string;
+  url?: string;
+  etag?: string;
+}
+
 export interface CalendarSearchOptions {
   query?: string;
   start?: Date;
