@@ -37,8 +37,27 @@ weil nodemailer kein Happy-Eyeballs macht und je nach Netz/VPN nur eine Adress-F
    genau ein aktives Skript. Bis zur Reparatur nicht benutzen. Für Sieve-Arbeiten den unabhängigen
    Client `C:\Projects\Familien-Kalender\sieve_add_rule.py` verwenden (Backup, `CHECKSCRIPT`,
    Zurückleseprobe, Rollback).
-2. Vollständiger Review des Servers läuft, Leitlinse „stille Falschauskunft“ (Werkzeug meldet Erfolg
-   oder Leere, obwohl die Operation fehlschlug). Bis die Befundliste vorliegt, keine Reparaturen.
+2. **Review durchgeführt (2026-08-23), Stufen 1 und 2 umgesetzt** auf Branch `fix/silent-failures`
+   (8 Commits, nicht gepusht). Befundbericht: `_claude-memory/plans/BEFUND_mailbox_mcp_2026-08-23.md`.
+   Leitbefund: ein Fehlschlag drang nirgends als Fehlschlag nach außen. Behoben für E-Mail,
+   Kalender und SMTP; Sieve steht noch aus (Stufe 3, Neubau des Protokoll-Lesers).
+
+   **Regeln, die daraus für diesen Code gelten:**
+   - Fehler per `classifyTransportError()` typisieren, nie am Meldungstext erkennen. Nur
+     `ConnectionError` darf zu Cache oder Default aufgeweicht werden; TLS-Fehler bewusst nicht.
+   - `withCacheFallback` ohne `defaultValue` aufrufen, außer der Ersatzwert ist vom echten
+     Ergebnis nicht unterscheidbar. Ein erfundener Default ist eine Falschauskunft.
+   - Bei ImapFlow, nodemailer und tsdav den Rückgabewert schreibender Aufrufe prüfen. Diese
+     Bibliotheken melden Ablehnung per `false` bzw. `Response.ok`, nicht per Exception.
+   - Mocks müssen diese Rückgabe-Semantik nachbilden (`mockResolvedValue(true)`), sonst ist
+     die Prüfung im Test unsichtbar.
+   - Nach `biome check --write` die Tests erneut laufen lassen. Die Regel `useArrowFunction`
+     hat schon einmal alle Mock-Konstruktoren zerlegt; betroffene Stellen tragen ein
+     `biome-ignore` mit Begründung.
+3. **Testsuite: kein Kontakt zum Produktivhost.** `tests/SieveService.test.ts` zeigte auf
+   `imap.mailbox.org:4190` und erzeugte pro Suite-Lauf einen Fehl-Login gegen einen Host mit
+   fail2ban. Steht jetzt auf `127.0.0.1`. Nicht zurückstellen, bevor es einen injizierbaren
+   Transport-Mock gibt.
 
 Projekt-Memory (cross-system): `_claude-memory/projects/familien-kalender/memory/`.
 
