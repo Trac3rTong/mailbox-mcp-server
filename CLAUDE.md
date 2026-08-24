@@ -55,9 +55,13 @@ Skript bestehen. Wirksam erst nach Neustart von Claude Desktop (lädt `dist/`).
      Bibliotheken melden Ablehnung per `false` bzw. `Response.ok`, nicht per Exception.
    - Mocks müssen diese Rückgabe-Semantik nachbilden (`mockResolvedValue(true)`), sonst ist
      die Prüfung im Test unsichtbar.
-   - Nach `biome check --write` die Tests erneut laufen lassen. Die Regel `useArrowFunction`
-     hat schon einmal alle Mock-Konstruktoren zerlegt; betroffene Stellen tragen ein
-     `biome-ignore` mit Begründung.
+   - **NIE `biome check --write` repo-weit fahren.** Es formatiert Dutzende unberührte Dateien um
+     (Zeilenenden, `useArrowFunction`) und hat damit an zwei Sessions in Folge (2026-08-23 und
+     2026-08-24) je ~30 Tests zerlegt und 30+ fremde Dateien angefasst. Wenn überhaupt, nur auf die
+     tatsächlich geänderten Dateien scopen (`biome check --write <datei> …`) und danach die Tests
+     erneut laufen lassen. `useArrowFunction` zerlegt sonst Mock-Konstruktoren; betroffene Stellen
+     tragen ein `biome-ignore` mit Begründung. **Folge-Task:** ein Pre-Commit-Hook / npm-Script, das
+     nur `git diff --name-only` formatiert, wäre der echte Fix (Prosa greift belegt nicht).
 2. **Testsuite: kein Kontakt zum Produktivhost — erledigt (2026-08-24).** `tests/SieveService.test.ts`
    treibt jetzt einen injizierbaren Fake-Transport (`SieveTransport`-Interface) und verbindet nie zu
    `imap.mailbox.org`. Der frühere Fehl-Login pro Lauf ist weg.
