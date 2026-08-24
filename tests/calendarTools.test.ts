@@ -498,6 +498,129 @@ describe("Calendar Tools", () => {
     });
   });
 
+  describe("handleCalendarTool - recurrence in get_calendar_events", () => {
+    it("surfaces recurrenceId and the scope hint for a recurring occurrence", async () => {
+      const occurrence: CalendarEvent = {
+        ...mockEvent,
+        recurring: true,
+        recurrenceId: "2026-08-17T09:00:00.000Z",
+        url: "https://caldav.example.com/cal/privat/jourfixe.ics",
+        etag: '"v1"',
+      };
+      vi.mocked(mockCalendarService.getCalendarEvents!).mockResolvedValue([
+        occurrence,
+      ]);
+
+      const result = await handleCalendarTool(
+        "get_calendar_events",
+        { start: "2026-08-17T00:00:00Z", end: "2026-08-18T00:00:00Z" },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(result.content[0].text).toContain(
+        "recurrenceId: 2026-08-17T09:00:00.000Z",
+      );
+      expect(result.content[0].text).toContain("applyToSeries: true");
+    });
+  });
+
+  describe("handleCalendarTool - update/delete routing", () => {
+    const URL = "https://caldav.example.com/cal/privat/jourfixe.ics";
+    const written = { success: true, message: "done", url: URL, uid: "u@x" };
+
+    beforeEach(() => {
+      mockCalendarService.updateEvent = vi.fn().mockResolvedValue(written);
+      mockCalendarService.updateSeries = vi.fn().mockResolvedValue(written);
+      mockCalendarService.updateOccurrence = vi.fn().mockResolvedValue(written);
+      mockCalendarService.deleteEvent = vi.fn().mockResolvedValue(written);
+      mockCalendarService.cancelOccurrence = vi.fn().mockResolvedValue(written);
+    });
+
+    const body = {
+      url: URL,
+      summary: "Titel",
+      start: "2026-08-17T14:00:00Z",
+      end: "2026-08-17T15:00:00Z",
+    };
+
+    it("routes update_event with recurrenceId to updateOccurrence", async () => {
+      await handleCalendarTool(
+        "update_event",
+        { ...body, recurrenceId: "2026-08-17T09:00:00.000Z" },
+        mockCalendarService as CalendarService,
+      );
+      expect(mockCalendarService.updateOccurrence).toHaveBeenCalledWith(
+        URL,
+        "2026-08-17T09:00:00.000Z",
+        expect.objectContaining({ summary: "Titel" }),
+        undefined,
+      );
+      expect(mockCalendarService.updateSeries).not.toHaveBeenCalled();
+      expect(mockCalendarService.updateEvent).not.toHaveBeenCalled();
+    });
+
+    it("routes update_event with applyToSeries to updateSeries", async () => {
+      await handleCalendarTool(
+        "update_event",
+        { ...body, applyToSeries: true },
+        mockCalendarService as CalendarService,
+      );
+      expect(mockCalendarService.updateSeries).toHaveBeenCalledTimes(1);
+      expect(mockCalendarService.updateOccurrence).not.toHaveBeenCalled();
+      expect(mockCalendarService.updateEvent).not.toHaveBeenCalled();
+    });
+
+    it("routes a plain update_event to updateEvent", async () => {
+      await handleCalendarTool(
+        "update_event",
+        body,
+        mockCalendarService as CalendarService,
+      );
+      expect(mockCalendarService.updateEvent).toHaveBeenCalledTimes(1);
+      expect(mockCalendarService.updateSeries).not.toHaveBeenCalled();
+      expect(mockCalendarService.updateOccurrence).not.toHaveBeenCalled();
+    });
+
+    it("rejects update_event that sets both recurrenceId and applyToSeries", async () => {
+      const result = await handleCalendarTool(
+        "update_event",
+        {
+          ...body,
+          recurrenceId: "2026-08-17T09:00:00.000Z",
+          applyToSeries: true,
+        },
+        mockCalendarService as CalendarService,
+      );
+      expect(result.isError).toBe(true);
+      expect(mockCalendarService.updateOccurrence).not.toHaveBeenCalled();
+      expect(mockCalendarService.updateSeries).not.toHaveBeenCalled();
+    });
+
+    it("routes delete_event with recurrenceId to cancelOccurrence", async () => {
+      await handleCalendarTool(
+        "delete_event",
+        { url: URL, recurrenceId: "2026-08-17T09:00:00.000Z" },
+        mockCalendarService as CalendarService,
+      );
+      expect(mockCalendarService.cancelOccurrence).toHaveBeenCalledWith(
+        URL,
+        "2026-08-17T09:00:00.000Z",
+        undefined,
+      );
+      expect(mockCalendarService.deleteEvent).not.toHaveBeenCalled();
+    });
+
+    it("routes a plain delete_event to deleteEvent", async () => {
+      await handleCalendarTool(
+        "delete_event",
+        { url: URL },
+        mockCalendarService as CalendarService,
+      );
+      expect(mockCalendarService.deleteEvent).toHaveBeenCalledTimes(1);
+      expect(mockCalendarService.cancelOccurrence).not.toHaveBeenCalled();
+    });
+  });
+
   describe("error handling", () => {
     it("should handle validation errors", async () => {
       const result = await handleCalendarTool(

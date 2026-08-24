@@ -206,7 +206,7 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
     {
       name: "update_event",
       description:
-        "Replace an existing event. Takes the url from get_calendar_events. Pass the etag as well so the write is refused if the event was changed elsewhere in the meantime; without it such a change is overwritten silently. All fields are replaced, so send the complete event, not only what changed.",
+        "Change an existing event. Takes the url from get_calendar_events. Pass the etag so the write is refused if the event was changed elsewhere in the meantime; without it such a change is overwritten silently. All fields are replaced, so send the complete event, not only what changed. For a RECURRING event you must name a scope: recurrenceId changes one occurrence (moving or renaming just it), applyToSeries changes every occurrence (title/location/etc.; the schedule of a series is kept, not moved). Updating a recurring event without either is refused so the series is not flattened.",
       inputSchema: {
         type: "object",
         properties: {
@@ -220,6 +220,18 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
             description:
               "ETag from get_calendar_events. Strongly recommended: it turns the write into a conditional request.",
           },
+          recurrenceId: {
+            type: "string",
+            format: "date-time",
+            description:
+              "Recurring events only: the target occurrence's original slot (the recurrenceId value from get_calendar_events). Changes just this one occurrence. Its start/end move to the values you pass.",
+          },
+          applyToSeries: {
+            type: "boolean",
+            description:
+              "Recurring events only: change every occurrence. Title/location/description/etc. are applied to the series; the recurrence schedule (start times, frequency) is left unchanged. Cannot be combined with recurrenceId.",
+            default: false,
+          },
         },
         required: ["url", "summary", "start", "end"],
         additionalProperties: false,
@@ -228,7 +240,7 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
     {
       name: "delete_event",
       description:
-        "Delete an event by its CalDAV url. Pass the etag so the deletion is refused if the event changed since it was read.",
+        "Delete an event by its CalDAV url. Pass the etag so the deletion is refused if the event changed since it was read. For a RECURRING event, pass recurrenceId to cancel just one occurrence; without it the whole series is deleted.",
       inputSchema: {
         type: "object",
         properties: {
@@ -239,6 +251,12 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
           etag: {
             type: "string",
             description: "ETag from get_calendar_events (recommended)",
+          },
+          recurrenceId: {
+            type: "string",
+            format: "date-time",
+            description:
+              "Recurring events only: cancel just this occurrence (its recurrenceId from get_calendar_events) instead of deleting the whole series.",
           },
         },
         required: ["url"],
@@ -289,17 +307,17 @@ ${event.location ? `Location: ${event.location}\n` : ""}${
     ? `Description: ${event.description.substring(0, 100)}${event.description.length > 100 ? "..." : ""}\n`
     : ""
 }Calendar: ${event.calendar}
-${
-  event.attendees?.length ? `Attendees: ${event.attendees.length}\n` : ""
-}${
+${event.attendees?.length ? `Attendees: ${event.attendees.length}\n` : ""}${
   event.recurring
-    ? `Recurring: Yes${event.isException ? " (this occurrence was moved or edited)" : ""}\n`
+    ? `Recurring: Yes${event.isException ? " (this occurrence was moved or edited)" : ""}\n${
+        event.recurrenceId ? `recurrenceId: ${event.recurrenceId}\n` : ""
+      }`
     : ""
 }${event.transparent ? "Blocks time: no (marked transparent)\n" : ""}${
   event.url
     ? `url: ${event.url}\netag: ${event.etag ?? "(none)"}${
         event.recurring
-          ? "\nNote: this url addresses the WHOLE series. Editing it changes every occurrence."
+          ? "\nNote: recurring event. To change ONE occurrence pass recurrenceId; to change the WHOLE series pass applyToSeries: true. Plain update_event/delete_event on a series is refused."
           : ""
       }\n`
     : ""
@@ -427,20 +445,35 @@ Keep these to change or delete the event later:
 
       case "update_event": {
         const a = validateInput(updateEventSchema, args);
-        const result = await calendarService.updateEvent(
-          a.url,
-          {
-            summary: a.summary,
-            start: new Date(a.start),
-            end: new Date(a.end),
-            allDay: a.allDay,
-            description: a.description,
-            location: a.location,
-            transparent: a.transparent,
-            categories: a.categories,
-          },
-          a.etag,
-        );
+        const body = {
+          summary: a.summary,
+          start: new Date(a.start),
+          end: new Date(a.end),
+          allDay: a.allDay,
+          description: a.description,
+          location: a.location,
+          transparent: a.transparent,
+          categories: a.categories,
+        };
+
+        // Route by scope: one occurrence, the whole series, or a plain single
+        // event. update_event refuses a recurring resource with no scope.
+        const result = a.recurrenceId
+          ? await calendarService.updateOccurrence(
+              a.url,
+              a.recurrenceId,
+              body,
+              a.etag,
+            )
+          : a.applyToSeries
+            ? await calendarService.updateSeries(a.url, body, a.etag)
+            : await calendarService.updateEvent(a.url, body, a.etag);
+
+        // A series-wide edit does not move the schedule, so the start/end just
+        // sent were not applied to the timing — don't print them as if they were.
+        const timing = a.applyToSeries
+          ? ""
+          : `\n${dayjs(a.start).format("YYYY-MM-DD HH:mm")} - ${dayjs(a.end).format("YYYY-MM-DD HH:mm")}`;
 
         return {
           content: [
@@ -448,11 +481,12 @@ Keep these to change or delete the event later:
               type: "text",
               text: `✅ ${result.message}
 
-**${a.summary}**
-${dayjs(a.start).format("YYYY-MM-DD HH:mm")} - ${dayjs(a.end).format("YYYY-MM-DD HH:mm")}${a.location ? `\nLocation: ${a.location}` : ""}
-${a.etag ? "" : "\n⚠️ Sent without an etag: a change made elsewhere since you read this event has just been overwritten without warning."}
-- url: ${result.url}
-- etag: ${result.etag ?? "(not returned; re-read the event before the next change)"}`,
+**${a.summary}**${timing}${a.location ? `\nLocation: ${a.location}` : ""}${
+                a.etag
+                  ? ""
+                  : "\n⚠️ Sent without an etag: a change made elsewhere since you read this event was not checked for."
+              }
+- url: ${result.url}${result.etag ? `\n- etag: ${result.etag}` : "\n- etag: (re-read the event before the next change)"}`,
             },
           ],
         };
@@ -460,14 +494,22 @@ ${a.etag ? "" : "\n⚠️ Sent without an etag: a change made elsewhere since yo
 
       case "delete_event": {
         const a = validateInput(deleteEventSchema, args);
-        const result = await calendarService.deleteEvent(a.url, a.etag);
+        // recurrenceId cancels one occurrence (EXDATE); otherwise delete the
+        // whole resource.
+        const result = a.recurrenceId
+          ? await calendarService.cancelOccurrence(
+              a.url,
+              a.recurrenceId,
+              a.etag,
+            )
+          : await calendarService.deleteEvent(a.url, a.etag);
 
         return {
           content: [
             {
               type: "text",
               text: `✅ ${result.message}
-- url: ${a.url}${a.etag ? "" : "\n⚠️ Deleted without an etag: no check was made for changes since you read this event."}`,
+- url: ${a.url}${a.etag ? "" : "\n⚠️ Done without an etag: no check was made for changes since you read this event."}`,
             },
           ],
         };

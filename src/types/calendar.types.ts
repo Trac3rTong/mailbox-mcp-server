@@ -22,7 +22,12 @@ export interface CalendarEvent {
   allDay: boolean;
   recurring: boolean;
   recurrenceRule?: string;
-  /** Set on an occurrence produced by expanding a recurrence rule. */
+  /**
+   * Set on an occurrence produced by expanding a recurrence rule: the
+   * occurrence's ORIGINAL slot as a UTC ISO instant. Pass it back to
+   * update_event/delete_event to target exactly this occurrence. For a moved
+   * occurrence it stays the original slot, not the shifted start.
+   */
   recurrenceId?: string;
   /** True when this occurrence overrides the series (its own VEVENT). */
   isException?: boolean;

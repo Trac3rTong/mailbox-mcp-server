@@ -19,17 +19,31 @@ const mockCreateCalendarObject = vi.fn();
 const mockUpdateCalendarObject = vi.fn();
 const mockDeleteCalendarObject = vi.fn();
 const mockFetchCalendars = vi.fn();
+const mockFetchCalendarObjects = vi.fn();
 
 vi.mock("tsdav", () => ({
   createDAVClient: vi.fn(async () => ({
     fetchCalendars: mockFetchCalendars,
-    fetchCalendarObjects: vi.fn(),
+    fetchCalendarObjects: mockFetchCalendarObjects,
     createCalendarObject: mockCreateCalendarObject,
     updateCalendarObject: mockUpdateCalendarObject,
     deleteCalendarObject: mockDeleteCalendarObject,
   })),
   DAVClient: class {},
 }));
+
+/** A plain, non-recurring resource — what updateEvent now reads before writing. */
+const SINGLE_ICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:abc@example.com
+DTSTAMP:20260101T090000Z
+DTSTART:20260901T090000Z
+DTEND:20260901T100000Z
+SUMMARY:Einzeltermin
+END:VEVENT
+END:VCALENDAR`;
 
 vi.mock("../src/services/Logger.js", () => ({
   createLogger: vi.fn(() => ({
@@ -121,8 +135,7 @@ describe("CalendarService writing", () => {
         "Privat",
       );
 
-      const ical: string =
-        mockCreateCalendarObject.mock.calls[0][0].iCalString;
+      const ical: string = mockCreateCalendarObject.mock.calls[0][0].iCalString;
       // ical.js escapes the separators; a string template would have produced a
       // broken VEVENT here.
       expect(ical).toContain("BEGIN:VEVENT");
@@ -153,8 +166,7 @@ describe("CalendarService writing", () => {
 
       await service.createEvent({ ...TERMIN, allDay: true }, "Privat");
 
-      const ical: string =
-        mockCreateCalendarObject.mock.calls[0][0].iCalString;
+      const ical: string = mockCreateCalendarObject.mock.calls[0][0].iCalString;
       expect(ical).toMatch(/DTSTART;VALUE=DATE:\d{8}/);
     });
 
@@ -167,6 +179,14 @@ describe("CalendarService writing", () => {
 
   describe("updateEvent", () => {
     const URL = "https://caldav.example.com/cal/privat/abc.ics";
+
+    beforeEach(() => {
+      // updateEvent now reads the resource first to refuse flattening a series.
+      // A non-recurring resource lets the plain-update path proceed.
+      mockFetchCalendarObjects.mockResolvedValue([
+        { url: URL, etag: '"current"', data: SINGLE_ICS },
+      ]);
+    });
 
     it("passes the etag through so the write is conditional", async () => {
       mockUpdateCalendarObject.mockResolvedValue(ok('"v2"'));

@@ -386,16 +386,28 @@ export const updateEventSchema = v.pipe(
     // Optional, but leaving it out disables the concurrency check and allows a
     // change made elsewhere to be overwritten without warning.
     etag: v.optional(v.pipe(v.string(), v.maxLength(200))),
+    // Recurrence scope. recurrenceId targets one occurrence (its original slot,
+    // as reported by get_calendar_events); applyToSeries changes every
+    // occurrence. Setting recurrenceId AND applyToSeries is contradictory.
+    recurrenceId: v.optional(dateSchema),
+    applyToSeries: v.optional(v.boolean(), false),
   }),
   v.check(
     data => new Date(data.end) >= new Date(data.start),
     END_NOT_BEFORE_START,
+  ),
+  v.check(
+    data => !(data.recurrenceId && data.applyToSeries),
+    "Pass either recurrenceId (one occurrence) or applyToSeries (whole series), not both",
   ),
 );
 
 export const deleteEventSchema = v.object({
   url: v.pipe(v.string(), v.minLength(1), v.maxLength(2000)),
   etag: v.optional(v.pipe(v.string(), v.maxLength(200))),
+  // When set, cancels just this occurrence of a series (its original slot, as
+  // reported by get_calendar_events) instead of deleting the whole resource.
+  recurrenceId: v.optional(dateSchema),
 });
 
 // =============================================================================

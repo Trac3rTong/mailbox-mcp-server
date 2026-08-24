@@ -7,10 +7,10 @@ import type {
   Attendee,
   CalDavConnection,
   CalendarEvent,
-  CalendarSearchOptions,
-  FreeBusyInfo,
   CalendarEventInput,
+  CalendarSearchOptions,
   CalendarWriteResult,
+  FreeBusyInfo,
 } from "../types/calendar.types.js";
 import {
   CalendarError,
@@ -329,10 +329,10 @@ export class CalendarService {
     start: Date;
     end: Date;
   } {
-    const start = options.start ?? new Date(Date.now() - 365 * 24 * 3600 * 1000);
+    const start =
+      options.start ?? new Date(Date.now() - 365 * 24 * 3600 * 1000);
     const end =
-      options.end ??
-      new Date(start.getTime() + 2 * 365 * 24 * 3600 * 1000);
+      options.end ?? new Date(start.getTime() + 2 * 365 * 24 * 3600 * 1000);
     return { start, end };
   }
 
@@ -464,7 +464,12 @@ export class CalendarService {
             start: occStart,
             end: occEnd,
             recurring: true,
-            recurrenceId: next.toString(),
+            // The occurrence's ORIGINAL slot as a UTC instant. This is the
+            // identity a caller passes back to change or cancel exactly this
+            // occurrence; next.toString() is zone-ambiguous and would not
+            // round-trip. For a moved occurrence this stays the original slot,
+            // not the shifted start.
+            recurrenceId: next.toJSDate().toISOString(),
             isException,
             url,
             etag,
@@ -950,6 +955,25 @@ export class CalendarService {
       );
     }
 
+    // Safety net against silently flattening a series. buildICalendar produces a
+    // single VEVENT with no RRULE/EXDATE/overrides; writing that over a
+    // recurring resource would replace the whole series with one event. Refuse
+    // and make the caller name a scope. Costs one extra read on the single-event
+    // path, which is worth closing a data-loss hole.
+    const { data } = await this.fetchRawObject(url);
+    const { master } = this.parseSeries(data);
+    if (master && new ICAL.Event(master).isRecurring()) {
+      const message =
+        "This is a recurring series. Updating it as a single event would drop the recurrence. Pass applyToSeries: true to change every occurrence, or recurrenceId to change just one.";
+      throw new CalendarError(
+        message,
+        ErrorCode.INVALID_INPUT,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
+      );
+    }
+
     const client = await this.getClient();
     const uid = this.uidFromUrl(url);
 
@@ -1006,6 +1030,401 @@ export class CalendarService {
     this.invalidateCalendarCache();
 
     return { success: true, message: "Event deleted", url };
+  }
+
+  // ---------------------------------------------------------------------
+  // Recurring series: change the whole series, or a single occurrence.
+  //
+  // These cannot rebuild the resource from a CalendarEventInput the way
+  // create/update do — that would drop RRULE, EXDATE and any existing
+  // per-occurrence overrides. They fetch the current iCalendar object, edit it
+  // with ical.js and write the whole thing back, mirroring how the read path
+  // already takes a series apart.
+  // ---------------------------------------------------------------------
+
+  /** Picks the calendar whose collection URL is a prefix of the event URL. */
+  private async resolveCalendarForUrl(eventUrl: string): Promise<DAVCalendar> {
+    const client = await this.getClient();
+    const calendars = await client.fetchCalendars();
+    const match = calendars.find(
+      cal => eventUrl.startsWith(cal.url) || eventUrl.includes(cal.url),
+    );
+    if (!match) {
+      throw new CalendarError(
+        `No calendar owns the resource ${eventUrl}`,
+        ErrorCode.CALENDAR_NOT_FOUND,
+      );
+    }
+    return match;
+  }
+
+  /**
+   * Reads the single iCalendar resource at `url`. Fails loudly if it is gone —
+   * an empty result here would be indistinguishable from "the event has no
+   * data", which is exactly the confusion the read path was cleaned up to avoid.
+   */
+  private async fetchRawObject(
+    url: string,
+  ): Promise<{ data: string; etag?: string }> {
+    const client = await this.getClient();
+    const calendar = await this.resolveCalendarForUrl(url);
+    const objects = await client.fetchCalendarObjects({
+      calendar,
+      objectUrls: [url],
+    });
+    const obj = objects?.[0];
+    if (!obj?.data) {
+      throw new CalendarError(
+        `The event at ${url} could not be found`,
+        ErrorCode.EVENT_NOT_FOUND,
+      );
+    }
+    return { data: obj.data, etag: obj.etag };
+  }
+
+  /** Splits a VCALENDAR into the series master and its per-occurrence overrides. */
+  private parseSeries(data: string): {
+    root: ICAL.Component;
+    master: ICAL.Component | null;
+    overrides: ICAL.Component[];
+  } {
+    const root = new ICAL.Component(ICAL.parse(data));
+    const vevents = root.getAllSubcomponents("vevent") as ICAL.Component[];
+    const overrides = vevents.filter(v =>
+      v.getFirstPropertyValue("recurrence-id"),
+    );
+    const master =
+      vevents.find(v => !v.getFirstPropertyValue("recurrence-id")) ?? null;
+    return { root, master, overrides };
+  }
+
+  /**
+   * The ical.js Time for the occurrence whose ORIGINAL slot matches `target`.
+   * Compared as absolute instants so a zoned or all-day series still matches;
+   * the returned Time carries the master's own type and zone, which is what a
+   * RECURRENCE-ID or EXDATE has to serialise with.
+   */
+  private findOccurrenceTime(
+    master: ICAL.Component,
+    target: Date,
+  ): ICAL.Time | null {
+    const event = new ICAL.Event(master);
+    if (!event.isRecurring()) return null;
+
+    const iterator = event.iterator();
+    const targetMs = target.getTime();
+    let next = iterator.next();
+    let guard = 0;
+
+    while (next && guard < CalendarService.MAX_OCCURRENCES_PER_SERIES) {
+      guard += 1;
+      const ms = next.toJSDate().getTime();
+      if (ms === targetMs) return next;
+      if (ms > targetMs) break;
+      next = iterator.next();
+    }
+    return null;
+  }
+
+  /** True when the override's RECURRENCE-ID names the same instant as `target`. */
+  private overrideMatches(override: ICAL.Component, target: Date): boolean {
+    const rid = override.getFirstPropertyValue("recurrence-id") as
+      | ICAL.Time
+      | undefined
+      | null;
+    return !!rid && rid.toJSDate().getTime() === target.getTime();
+  }
+
+  /**
+   * Writes event fields onto an existing VEVENT. Timing (DTSTART/DTEND) is
+   * optional because a whole-series edit must not move the master's anchor — the
+   * value a caller has is an occurrence start, not the series start, and writing
+   * it onto the master would shift and re-slot the entire series.
+   */
+  private applyBodyToComponent(
+    vevent: ICAL.Component,
+    input: CalendarEventInput,
+    includeTiming: boolean,
+  ): void {
+    vevent.updatePropertyWithValue("summary", input.summary);
+
+    vevent.removeAllProperties("description");
+    if (input.description) {
+      vevent.updatePropertyWithValue("description", input.description);
+    }
+
+    vevent.removeAllProperties("location");
+    if (input.location) {
+      vevent.updatePropertyWithValue("location", input.location);
+    }
+
+    vevent.removeAllProperties("transp");
+    if (input.transparent) {
+      vevent.updatePropertyWithValue("transp", "TRANSPARENT");
+    }
+
+    vevent.removeAllProperties("categories");
+    if (input.categories?.length) {
+      vevent.updatePropertyWithValue("categories", input.categories.join(","));
+    }
+
+    if (includeTiming) {
+      const event = new ICAL.Event(vevent);
+      const start = ICAL.Time.fromJSDate(input.start, true);
+      const end = ICAL.Time.fromJSDate(input.end, true);
+      if (input.allDay) {
+        start.isDate = true;
+        end.isDate = true;
+      }
+      event.startDate = start;
+      event.endDate = end;
+    }
+
+    const now = ICAL.Time.fromJSDate(new Date(), true);
+    vevent.updatePropertyWithValue("last-modified", now);
+    vevent.updatePropertyWithValue("dtstamp", now);
+  }
+
+  /** Sets the TZID parameter on a time property when the time is zoned. */
+  private tagZone(property: ICAL.Property, time: ICAL.Time): void {
+    const zone = time.zone;
+    if (
+      zone &&
+      zone !== ICAL.Timezone.utcTimezone &&
+      zone !== ICAL.Timezone.localTimezone &&
+      zone.tzid
+    ) {
+      property.setParameter("tzid", zone.tzid);
+    }
+  }
+
+  /**
+   * Writes the modified VCALENDAR back to `url`, conditional on `etag`. A 412
+   * means the resource changed since it was read; the change is refused rather
+   * than clobbering the newer version.
+   */
+  private async writeBack(
+    url: string,
+    data: string,
+    etag: string | undefined,
+    operation: string,
+  ): Promise<void> {
+    const client = await this.getClient();
+    const response = await client.updateCalendarObject({
+      calendarObject: { url, data, etag },
+    });
+
+    if (response?.status === 412) {
+      throw new CalendarError(
+        "The event was changed elsewhere since it was read",
+        ErrorCode.CALENDAR_EDIT_CONFLICT,
+        undefined,
+        undefined,
+        {
+          details: {
+            userMessage:
+              "This event was changed elsewhere after you read it. Read it again before changing it.",
+          },
+        },
+      );
+    }
+    this.assertWriteAccepted(response, operation);
+    this.invalidateCalendarCache();
+  }
+
+  private seriesUid(master: ICAL.Component, url: string): string {
+    return (
+      (master.getFirstPropertyValue("uid") as string) || this.uidFromUrl(url)
+    );
+  }
+
+  private ensureRecurring(
+    master: ICAL.Component | null,
+    url: string,
+  ): ICAL.Component {
+    if (!master) {
+      throw new CalendarError(
+        `The resource ${url} holds no series master`,
+        ErrorCode.EVENT_NOT_FOUND,
+      );
+    }
+    if (!new ICAL.Event(master).isRecurring()) {
+      const message =
+        "This event is not a recurring series. Use update_event / delete_event without a recurrence scope.";
+      throw new CalendarError(
+        message,
+        ErrorCode.INVALID_INPUT,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
+      );
+    }
+    return master;
+  }
+
+  /**
+   * Changes fields on every occurrence of a series while leaving its schedule
+   * intact. Timing is deliberately NOT changed here (see applyBodyToComponent):
+   * moving a series in time is a separate, rarer operation.
+   */
+  async updateSeries(
+    url: string,
+    input: CalendarEventInput,
+    etag?: string,
+  ): Promise<CalendarWriteResult> {
+    const { data, etag: currentEtag } = await this.fetchRawObject(url);
+    const { root, master } = this.parseSeries(data);
+    const series = this.ensureRecurring(master, url);
+
+    this.applyBodyToComponent(series, input, false);
+
+    await this.writeBack(
+      url,
+      root.toString(),
+      etag ?? currentEtag,
+      "Updating the series",
+    );
+
+    return {
+      success: true,
+      message: `Series '${input.summary}' updated across all occurrences (schedule unchanged)`,
+      uid: this.seriesUid(series, url),
+      url,
+    };
+  }
+
+  /**
+   * Changes a single occurrence of a series by writing (or updating) a
+   * RECURRENCE-ID override VEVENT. `recurrenceId` is the occurrence's original
+   * slot (the value get_calendar_events reports), matched by instant.
+   */
+  async updateOccurrence(
+    url: string,
+    recurrenceId: string,
+    input: CalendarEventInput,
+    etag?: string,
+  ): Promise<CalendarWriteResult> {
+    if (input.end < input.start) {
+      throw new ValidationError(
+        "The event ends before it starts",
+        "end",
+        input.end,
+      );
+    }
+    const target = new Date(recurrenceId);
+    if (Number.isNaN(target.getTime())) {
+      throw new ValidationError(
+        "recurrenceId is not a valid date",
+        "recurrenceId",
+        recurrenceId,
+      );
+    }
+
+    const { data, etag: currentEtag } = await this.fetchRawObject(url);
+    const { root, master, overrides } = this.parseSeries(data);
+    const series = this.ensureRecurring(master, url);
+
+    const occTime = this.findOccurrenceTime(series, target);
+    if (!occTime) {
+      const message = `No occurrence of this series starts at ${recurrenceId}`;
+      throw new CalendarError(
+        message,
+        ErrorCode.EVENT_NOT_FOUND,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
+      );
+    }
+
+    let override = overrides.find(o => this.overrideMatches(o, target));
+    if (!override) {
+      override = new ICAL.Component("vevent");
+      override.updatePropertyWithValue("uid", this.seriesUid(series, url));
+      const recProp = override.updatePropertyWithValue(
+        "recurrence-id",
+        occTime,
+      );
+      this.tagZone(recProp, occTime);
+      override.updatePropertyWithValue(
+        "created",
+        ICAL.Time.fromJSDate(new Date(), true),
+      );
+      root.addSubcomponent(override);
+    }
+
+    this.applyBodyToComponent(override, input, true);
+
+    await this.writeBack(
+      url,
+      root.toString(),
+      etag ?? currentEtag,
+      "Updating the occurrence",
+    );
+
+    return {
+      success: true,
+      message: `Occurrence on ${recurrenceId} updated`,
+      uid: this.seriesUid(series, url),
+      url,
+    };
+  }
+
+  /**
+   * Cancels a single occurrence of a series: adds an EXDATE for its original
+   * slot and drops any override that used to move it.
+   */
+  async cancelOccurrence(
+    url: string,
+    recurrenceId: string,
+    etag?: string,
+  ): Promise<CalendarWriteResult> {
+    const target = new Date(recurrenceId);
+    if (Number.isNaN(target.getTime())) {
+      throw new ValidationError(
+        "recurrenceId is not a valid date",
+        "recurrenceId",
+        recurrenceId,
+      );
+    }
+
+    const { data, etag: currentEtag } = await this.fetchRawObject(url);
+    const { root, master, overrides } = this.parseSeries(data);
+    const series = this.ensureRecurring(master, url);
+
+    const occTime = this.findOccurrenceTime(series, target);
+    if (!occTime) {
+      const message = `No occurrence of this series starts at ${recurrenceId}`;
+      throw new CalendarError(
+        message,
+        ErrorCode.EVENT_NOT_FOUND,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
+      );
+    }
+
+    const exProp = series.addPropertyWithValue("exdate", occTime);
+    this.tagZone(exProp, occTime);
+
+    for (const override of overrides) {
+      if (this.overrideMatches(override, target)) {
+        root.removeSubcomponent(override);
+      }
+    }
+
+    await this.writeBack(
+      url,
+      root.toString(),
+      etag ?? currentEtag,
+      "Cancelling the occurrence",
+    );
+
+    return {
+      success: true,
+      message: `Occurrence on ${recurrenceId} cancelled`,
+      uid: this.seriesUid(series, url),
+      url,
+    };
   }
 
   private uidFromUrl(url: string): string {
