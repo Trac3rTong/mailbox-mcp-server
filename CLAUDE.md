@@ -28,19 +28,23 @@ weil nodemailer kein Happy-Eyeballs macht und je nach Netz/VPN nur eine Adress-F
    `rejectUnauthorized: true`. `tls.servername` ist durch den Happy-Eyeballs-Fix auf `smtp.mailbox.org`
    gesetzt, damit verifiziert TLS korrekt trotz IP-Literal-Host. IMAP/CalDAV/Sieve prüften immer korrekt.
 
+**Sieve repariert und entsperrt (2026-08-24, Commit `4513eea`):**
+Der `SieveService`-Reader ist neu gebaut (literal-bewusst, byte-genau auf `Buffer`; die Framing-Teile
+portiert aus `Rheopyrin/ox-mcp`, MIT, mit Attribution im Datei-Header). `LISTSCRIPTS` liefert wieder
+korrekt (`Open-Xchange` ACTIVE statt „0 Skripte"), `GETSCRIPT` byte-gleich inkl. Umlauten, Client-Literale
+`{n+}` mit Oktett-Länge, TLS-Pflicht vor dem Passwort. `create_sieve_filter` aktiviert **nie** mehr
+(kein `activate`-Parameter); `activate_sieve_script` prüft die Existenz und meldet, welches Skript es
+deaktiviert — nie stilles `SETACTIVE`. Live gegen den echten Server verifiziert (Wegwerfskript, aktives
+OX-Skript unberührt). **Die 7 `mcp__mailbox__*`-Sieve-Tools sind wieder benutzbar.** Der unabhängige
+Not-Client `C:\Projects\Familien-Kalender\sieve_add_rule.py` bleibt für Byte-genaue Chirurgie am aktiven
+Skript bestehen. Wirksam erst nach Neustart von Claude Desktop (lädt `dist/`).
+
 **Offene Punkte:**
-1. **Sieve-Werkzeuge gesperrt (Incident 2026-08-23).** Der `SieveService` meldet nachweislich Falsches:
-   `LISTSCRIPTS` lieferte null Skripte bei drei vorhandenen, `GETSCRIPT` gab die Login-Antwort zurück
-   (Antwort-Zuordnung im Response-Reader). Client-Literale werden als `{n}` statt `{n+}` gesendet
-   (RFC 5804), die Länge kommt aus `content.length` statt aus der Oktett-Länge. Ein `SETACTIVE` aus
-   einer Claude-Sitzung hat 47 produktive Filterregeln der App Suite stillgelegt — ManageSieve erlaubt
-   genau ein aktives Skript. Bis zur Reparatur nicht benutzen. Für Sieve-Arbeiten den unabhängigen
-   Client `C:\Projects\Familien-Kalender\sieve_add_rule.py` verwenden (Backup, `CHECKSCRIPT`,
-   Zurückleseprobe, Rollback).
-2. **Review durchgeführt (2026-08-23), Stufen 1 und 2 umgesetzt** auf Branch `fix/silent-failures`
-   (8 Commits, nicht gepusht). Befundbericht: `_claude-memory/plans/BEFUND_mailbox_mcp_2026-08-23.md`.
+1. **Review durchgeführt (2026-08-23), Stufen 1 und 2 umgesetzt** auf Branch `fix/silent-failures`
+   (nicht gepusht; Sieve-Stufe 3 als `4513eea` obendrauf). Befundbericht:
+   `_claude-memory/plans/BEFUND_mailbox_mcp_2026-08-23.md`.
    Leitbefund: ein Fehlschlag drang nirgends als Fehlschlag nach außen. Behoben für E-Mail,
-   Kalender und SMTP; Sieve steht noch aus (Stufe 3, Neubau des Protokoll-Lesers).
+   Kalender, SMTP und (2026-08-24) Sieve.
 
    **Regeln, die daraus für diesen Code gelten:**
    - Fehler per `classifyTransportError()` typisieren, nie am Meldungstext erkennen. Nur
@@ -54,10 +58,9 @@ weil nodemailer kein Happy-Eyeballs macht und je nach Netz/VPN nur eine Adress-F
    - Nach `biome check --write` die Tests erneut laufen lassen. Die Regel `useArrowFunction`
      hat schon einmal alle Mock-Konstruktoren zerlegt; betroffene Stellen tragen ein
      `biome-ignore` mit Begründung.
-3. **Testsuite: kein Kontakt zum Produktivhost.** `tests/SieveService.test.ts` zeigte auf
-   `imap.mailbox.org:4190` und erzeugte pro Suite-Lauf einen Fehl-Login gegen einen Host mit
-   fail2ban. Steht jetzt auf `127.0.0.1`. Nicht zurückstellen, bevor es einen injizierbaren
-   Transport-Mock gibt.
+2. **Testsuite: kein Kontakt zum Produktivhost — erledigt (2026-08-24).** `tests/SieveService.test.ts`
+   treibt jetzt einen injizierbaren Fake-Transport (`SieveTransport`-Interface) und verbindet nie zu
+   `imap.mailbox.org`. Der frühere Fehl-Login pro Lauf ist weg.
 
 Projekt-Memory (cross-system): `_claude-memory/projects/familien-kalender/memory/`.
 
