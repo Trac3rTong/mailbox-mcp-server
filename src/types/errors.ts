@@ -41,7 +41,10 @@ export enum ErrorCode {
   CALENDAR_NOT_FOUND = "CALENDAR_NOT_FOUND",
   EVENT_NOT_FOUND = "EVENT_NOT_FOUND",
   INVALID_DATE_RANGE = "INVALID_DATE_RANGE",
+  /** Two events overlap in time. */
   CALENDAR_CONFLICT = "CALENDAR_CONFLICT",
+  /** The resource changed between reading it and writing it back (HTTP 412). */
+  CALENDAR_EDIT_CONFLICT = "CALENDAR_EDIT_CONFLICT",
 
   // Cache errors
   CACHE_ERROR = "CACHE_ERROR",
@@ -304,6 +307,14 @@ export class CalendarError extends MCPError {
   }
 
   getUserMessage(): string {
+    // A thrower may supply text that is more useful than any per-code sentence
+    // — the list of calendars that do exist, for instance. Without this the
+    // generic line replaced it and the caller lost the actionable part.
+    const explicit = this.context?.details?.userMessage;
+    if (typeof explicit === "string" && explicit.length > 0) {
+      return explicit;
+    }
+
     switch (this.code) {
       case ErrorCode.CALENDAR_NOT_FOUND:
         return "The specified calendar could not be found.";
@@ -313,6 +324,8 @@ export class CalendarError extends MCPError {
         return "The specified date range is invalid.";
       case ErrorCode.CALENDAR_CONFLICT:
         return "There is a scheduling conflict with this calendar event.";
+      case ErrorCode.CALENDAR_EDIT_CONFLICT:
+        return "This event was changed elsewhere after you read it. Read it again and reapply your change.";
       default:
         return "A calendar operation failed. Please try again.";
     }

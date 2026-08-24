@@ -818,6 +818,13 @@ export class CalendarService {
       throw new CalendarError(
         `No calendar named '${name}'. Available: ${bekannt}`,
         ErrorCode.CALENDAR_NOT_FOUND,
+        undefined,
+        undefined,
+        {
+          details: {
+            userMessage: `No calendar named '${name}'. Available: ${bekannt}`,
+          },
+        },
       );
     }
     return match;
@@ -867,11 +874,15 @@ export class CalendarService {
     operation: string,
   ): void {
     if (response?.ok) return;
+    const detail = `${operation} was refused by the server (HTTP ${
+      response?.status ?? "?"
+    } ${response?.statusText ?? ""})`.trim();
     throw new CalendarError(
-      `${operation} was refused by the server (HTTP ${response?.status ?? "?"} ${
-        response?.statusText ?? ""
-      })`.trim(),
+      detail,
       ErrorCode.OPERATION_FAILED,
+      undefined,
+      undefined,
+      { details: { userMessage: detail } },
     );
   }
 
@@ -952,8 +963,8 @@ export class CalendarService {
 
     if (response?.status === 412) {
       throw new CalendarError(
-        "The event was changed elsewhere since it was read. Fetch it again and reapply the change.",
-        ErrorCode.CALENDAR_CONFLICT,
+        "The event was changed elsewhere since it was read",
+        ErrorCode.CALENDAR_EDIT_CONFLICT,
       );
     }
     this.assertWriteAccepted(response, "Updating the event");
@@ -978,8 +989,16 @@ export class CalendarService {
 
     if (response?.status === 412) {
       throw new CalendarError(
-        "The event was changed elsewhere since it was read. Fetch it again before deleting.",
-        ErrorCode.CALENDAR_CONFLICT,
+        "The event was changed elsewhere since it was read",
+        ErrorCode.CALENDAR_EDIT_CONFLICT,
+        undefined,
+        undefined,
+        {
+          details: {
+            userMessage:
+              "This event was changed elsewhere after you read it. Read it again before deleting.",
+          },
+        },
       );
     }
     this.assertWriteAccepted(response, "Deleting the event");
