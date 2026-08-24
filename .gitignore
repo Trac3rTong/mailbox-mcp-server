@@ -39,3 +39,6 @@ WARP.md
 docs/
 
 .testpw
+
+# Local-only project notes (fork status, personal paths) — not for the public fork
+CLAUDE.local.md
