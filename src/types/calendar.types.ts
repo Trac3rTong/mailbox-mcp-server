@@ -6,7 +6,13 @@ export interface Attendee {
 }
 
 export interface CalendarEvent {
+  /**
+   * Identifies THIS occurrence. For a recurring series every occurrence shares
+   * the uid, so the id carries the occurrence start as well. Using the bare uid
+   * gave every occurrence of a weekly meeting the same id.
+   */
   id: string;
+  /** Identifies the SERIES. Not unique across occurrences. */
   uid: string;
   summary: string;
   description?: string;
@@ -16,13 +22,28 @@ export interface CalendarEvent {
   allDay: boolean;
   recurring: boolean;
   recurrenceRule?: string;
+  /** Set on an occurrence produced by expanding a recurrence rule. */
+  recurrenceId?: string;
+  /** True when this occurrence overrides the series (its own VEVENT). */
+  isException?: boolean;
+  /** TRANSP:TRANSPARENT — the organiser marked this as not blocking time. */
+  transparent?: boolean;
   attendees?: Attendee[];
   organizer?: {
     email: string;
     name?: string;
   };
   calendar: string;
+  /**
+   * URL of the CalDAV resource holding this event. Required to modify or delete
+   * it later; the read path used to drop it.
+   */
   url?: string;
+  /**
+   * ETag of that resource. Sending it back with a change is what stops an edit
+   * from silently overwriting a change made elsewhere in the meantime.
+   */
+  etag?: string;
   categories?: string[];
   created: Date;
   modified: Date;

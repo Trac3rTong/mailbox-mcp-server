@@ -244,7 +244,11 @@ export class CalendarService {
         },
       );
 
-      return await this.parseCalendarObjects(calendarObjects, calendar);
+      return await this.parseCalendarObjects(
+        calendarObjects,
+        calendar,
+        options,
+      );
     } catch (error) {
       this.logger.error(
         `Error fetching events from calendar ${calendar}`,
@@ -271,13 +275,20 @@ export class CalendarService {
   private parseCalendarObjects(
     calendarObjects: DAVObject[],
     calendar: string,
+    options: CalendarSearchOptions = {},
   ): CalendarEvent[] {
     const events: CalendarEvent[] = [];
 
     try {
       for (const obj of calendarObjects) {
         if (obj.data) {
-          const parsedEvents = this.parseICalData(obj.data, calendar);
+          const parsedEvents = this.parseICalData(
+            obj.data,
+            calendar,
+            options,
+            obj.url,
+            obj.etag,
+          );
           events.push(...parsedEvents);
         }
       }
@@ -295,7 +306,35 @@ export class CalendarService {
     return events;
   }
 
-  private parseICalData(icalData: string, calendar: string): CalendarEvent[] {
+  /**
+   * Upper bound on occurrences generated from a single series. An RRULE without
+   * UNTIL or COUNT is infinite; the window normally stops the iteration, but
+   * this guards against a malformed rule spinning forever.
+   */
+  private static readonly MAX_OCCURRENCES_PER_SERIES = 750;
+
+  /**
+   * Window to expand into when the caller did not give one. Unbounded expansion
+   * is not an option for an infinite rule.
+   */
+  private defaultExpansionWindow(options: CalendarSearchOptions): {
+    start: Date;
+    end: Date;
+  } {
+    const start = options.start ?? new Date(Date.now() - 365 * 24 * 3600 * 1000);
+    const end =
+      options.end ??
+      new Date(start.getTime() + 2 * 365 * 24 * 3600 * 1000);
+    return { start, end };
+  }
+
+  private parseICalData(
+    icalData: string,
+    calendar: string,
+    options: CalendarSearchOptions = {},
+    url?: string,
+    etag?: string,
+  ): CalendarEvent[] {
     const events: CalendarEvent[] = [];
 
     try {
@@ -303,10 +342,52 @@ export class CalendarService {
       const comp = new ICAL.Component(jcalData);
       const vevents = comp.getAllSubcomponents("vevent");
 
-      for (const vevent of vevents) {
-        const event = this.parseVEvent(vevent, calendar);
-        if (event) {
-          events.push(event);
+      // A single calendar object holds the series master plus one VEVENT per
+      // modified occurrence, each carrying RECURRENCE-ID. Feeding them all
+      // through parseVEvent produced duplicates that shared one id.
+      const masters: ICAL.Component[] = [];
+      const overrides: ICAL.Component[] = [];
+      for (const vevent of vevents as ICAL.Component[]) {
+        if (vevent.getFirstPropertyValue("recurrence-id")) {
+          overrides.push(vevent);
+        } else {
+          masters.push(vevent);
+        }
+      }
+
+      const handledOverrides = new Set<ICAL.Component>();
+
+      for (const master of masters) {
+        const event = new ICAL.Event(master);
+
+        for (const override of overrides) {
+          if (override.getFirstPropertyValue("uid") === event.uid) {
+            try {
+              event.relateException(override);
+              handledOverrides.add(override);
+            } catch {
+              // Not relatable to this master; handled as a standalone below.
+            }
+          }
+        }
+
+        if (event.isRecurring()) {
+          events.push(
+            ...this.expandRecurringEvent(event, calendar, options, url, etag),
+          );
+        } else {
+          const single = this.parseVEvent(master, calendar, url, etag);
+          if (single) events.push(single);
+        }
+      }
+
+      // Overrides whose master is not in this object (server returned only the
+      // modified instance). Dropping them would hide a real appointment.
+      for (const override of overrides) {
+        if (handledOverrides.has(override)) continue;
+        const orphan = this.parseVEvent(override, calendar, url, etag);
+        if (orphan) {
+          events.push({ ...orphan, isException: true });
         }
       }
     } catch (error) {
@@ -323,7 +404,101 @@ export class CalendarService {
     return events;
   }
 
-  private parseVEvent(vevent: unknown, calendar: string): CalendarEvent | null {
+  /**
+   * Turn a recurrence rule into the individual occurrences inside the window.
+   *
+   * Without this the server's master VEVENT was reported as-is, with its
+   * original DTSTART. A weekly meeting set up six months ago showed up dated six
+   * months back, sorted to the front of every list, and — because
+   * calculateFreeBusy compares against that same stale date — never appeared as
+   * busy. get_free_busy therefore reported occupied slots as free.
+   */
+  private expandRecurringEvent(
+    event: ICAL.Event,
+    calendar: string,
+    options: CalendarSearchOptions,
+    url?: string,
+    etag?: string,
+  ): CalendarEvent[] {
+    const { start: windowStart, end: windowEnd } =
+      this.defaultExpansionWindow(options);
+    const occurrences: CalendarEvent[] = [];
+
+    try {
+      const base = this.parseVEvent(event.component, calendar, url, etag);
+      if (!base) return [];
+
+      const iterator = event.iterator();
+      let next = iterator.next();
+      let guard = 0;
+
+      while (next && guard < CalendarService.MAX_OCCURRENCES_PER_SERIES) {
+        guard += 1;
+
+        const details = event.getOccurrenceDetails(next);
+        const occStart = details.startDate.toJSDate();
+        const occEnd = details.endDate.toJSDate();
+
+        if (occStart > windowEnd) break;
+
+        // Half-open overlap: an occurrence ending exactly at the window start
+        // does not fall inside it.
+        if (occEnd > windowStart) {
+          const isException = details.item !== event;
+          const overridden = isException
+            ? this.parseVEvent(details.item.component, calendar, url, etag)
+            : null;
+
+          occurrences.push({
+            ...(overridden ?? base),
+            id: `${event.uid}#${occStart.toISOString()}`,
+            uid: event.uid,
+            start: occStart,
+            end: occEnd,
+            recurring: true,
+            recurrenceId: next.toString(),
+            isException,
+            url,
+            etag,
+          });
+        }
+
+        next = iterator.next();
+      }
+
+      if (guard >= CalendarService.MAX_OCCURRENCES_PER_SERIES) {
+        this.logger.warning(
+          "Recurrence expansion hit its occurrence cap; the series may be truncated",
+          { operation: "expandRecurringEvent", service: "CalendarService" },
+          {
+            uid: event.uid,
+            cap: CalendarService.MAX_OCCURRENCES_PER_SERIES,
+          },
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        "Error expanding recurring event",
+        { operation: "expandRecurringEvent", service: "CalendarService" },
+        {
+          uid: event.uid,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      // Fall back to the unexpanded master rather than dropping the series.
+      const base = this.parseVEvent(event.component, calendar, url, etag);
+      return base ? [base] : [];
+    }
+
+    return occurrences;
+  }
+
+  private parseVEvent(
+    vevent: unknown,
+    calendar: string,
+    url?: string,
+    etag?: string,
+  ): CalendarEvent | null {
     try {
       const event = new ICAL.Event(vevent as ICAL.Component);
 
@@ -341,6 +516,12 @@ export class CalendarService {
         ...timeInfo,
         ...participantInfo,
         ...metadataInfo,
+        url,
+        etag,
+        transparent:
+          String(
+            event.component.getFirstPropertyValue("transp") ?? "",
+          ).toUpperCase() === "TRANSPARENT",
       };
     } catch (error) {
       this.logger.error(
@@ -556,6 +737,11 @@ export class CalendarService {
     const busy: Array<{ start: Date; end: Date; summary?: string }> = [];
 
     for (const event of events) {
+      // TRANSP:TRANSPARENT means the organiser explicitly marked the entry as
+      // not blocking time (an all-day "Homeoffice" note, for instance). It used
+      // to make the whole day look occupied.
+      if (event.transparent) continue;
+
       if (event.start < end && event.end > start) {
         busy.push({
           start: new Date(Math.max(event.start.getTime(), start.getTime())),

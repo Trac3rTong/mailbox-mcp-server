@@ -52,8 +52,15 @@ vi.mock("ical.js", () => {
     Component: class {
       getAllSubcomponents(type: string) {
         if (type === "vevent") {
-          // Return mock vevent data that will work with ICAL.Event
-          return [["vevent", [], []]];
+          // A VEVENT subcomponent, not a raw jCal array: the service asks it for
+          // RECURRENCE-ID to tell a series master from an overridden occurrence.
+          // Returning bare arrays made that call throw, and the whole parse then
+          // yielded nothing.
+          return [
+            {
+              getFirstPropertyValue: (_prop: string) => null,
+            },
+          ];
         }
         return [];
       }
