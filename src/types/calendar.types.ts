@@ -76,6 +76,30 @@ export interface CalendarWriteResult {
   etag?: string;
 }
 
+/**
+ * One calendar as reported by list_calendars. The collection URL is what a
+ * caller passes to put_ics / create_event; the display name is what a human
+ * recognises. An empty calendar is invisible to get_calendar_events, so this is
+ * the only way to learn it exists at all.
+ */
+export interface CalendarInfo {
+  name: string;
+  url: string;
+  /** Hex/CSS colour the server stores for the calendar, if any. */
+  color?: string;
+  /** Component types the collection accepts (e.g. VEVENT, VTODO). */
+  components?: string[];
+  /** Change tag of the whole collection; changes when any event in it changes. */
+  ctag?: string;
+}
+
+/** Raw iCalendar text of a single resource, with the identity to write it back. */
+export interface RawCalendarObject {
+  url: string;
+  etag?: string;
+  ics: string;
+}
+
 export interface CalendarSearchOptions {
   query?: string;
   start?: Date;

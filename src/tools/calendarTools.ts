@@ -13,6 +13,9 @@ import {
   deleteEventSchema,
   getCalendarEventsSchema,
   getFreeBusySchema,
+  getIcsSchema,
+  listCalendarsSchema,
+  putIcsSchema,
   searchCalendarSchema,
   updateEventSchema,
   validateInput,
@@ -62,6 +65,9 @@ export const CALENDAR_TOOLS = [
   "create_event",
   "update_event",
   "delete_event",
+  "list_calendars",
+  "get_ics",
+  "put_ics",
 ] as const;
 
 export type CalendarToolName = (typeof CALENDAR_TOOLS)[number];
@@ -188,7 +194,7 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
     {
       name: "create_event",
       description:
-        "Create a new event in a mailbox.org calendar. Returns the url and etag of the new event; both are needed to change or delete it later.",
+        "Create a new event in a mailbox.org calendar. Returns the uid, url and etag of the new event; url and etag are needed to change or delete it later, the uid is the stable anchor for matching it against a copy in another system.",
       inputSchema: {
         type: "object",
         properties: {
@@ -197,6 +203,11 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
             type: "string",
             description:
               "Calendar to create the event in (optional, uses the first calendar if omitted)",
+          },
+          uid: {
+            type: "string",
+            description:
+              "Optional UID to give the event. Pass the origin system's UID when mirroring an event so both copies share one stable anchor. Omitted: the server assigns its own. Cannot express a recurrence rule — use put_ics for a recurring series.",
           },
         },
         required: ["summary", "start", "end"],
@@ -263,6 +274,64 @@ export function createCalendarTools(calendarService: CalendarService): Tool[] {
         additionalProperties: false,
       },
     },
+    {
+      name: "list_calendars",
+      description:
+        "List the account's calendars with their collection URL and metadata. Use it to learn which calendars exist before writing, and to tell an empty-but-real calendar apart from a name that does not exist (an empty calendar returns no events, so get_calendar_events cannot reveal it).",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "get_ics",
+      description:
+        "Fetch the raw iCalendar (VCALENDAR) text of one event resource by its url. Lossless: keeps RRULE, EXDATE, per-occurrence overrides, attendees and alarms. Pair with put_ics to mirror an event into another calendar without losing fields.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "URL of the CalDAV resource, from get_calendar_events",
+          },
+        },
+        required: ["url"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "put_ics",
+      description:
+        "Write a raw iCalendar (VCALENDAR) object into a calendar verbatim. This is the only way to create a RECURRING series (create_event cannot express an RRULE). The body must contain a VEVENT with a UID. Without an etag it creates the resource; with an etag it conditionally replaces an existing one (refused if it changed elsewhere). Returns the uid and url.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          calendar: {
+            type: "string",
+            description:
+              "Calendar to write into (optional, uses the first calendar if omitted)",
+          },
+          ics: {
+            type: "string",
+            description:
+              "Raw VCALENDAR text, including a VEVENT with a UID. Typically obtained from get_ics on the source system.",
+          },
+          filename: {
+            type: "string",
+            description:
+              "Optional resource filename. Defaults to '<uid>.ics' derived from the body. No path separators.",
+          },
+          etag: {
+            type: "string",
+            description:
+              "ETag of an existing resource to replace conditionally. Omit to create a new resource.",
+          },
+        },
+        required: ["ics"],
+        additionalProperties: false,
+      },
+    },
   ];
 }
 
@@ -307,6 +376,7 @@ ${event.location ? `Location: ${event.location}\n` : ""}${
     ? `Description: ${event.description.substring(0, 100)}${event.description.length > 100 ? "..." : ""}\n`
     : ""
 }Calendar: ${event.calendar}
+uid: ${event.uid}
 ${event.attendees?.length ? `Attendees: ${event.attendees.length}\n` : ""}${
   event.recurring
     ? `Recurring: Yes${event.isException ? " (this occurrence was moved or edited)" : ""}\n${
@@ -424,6 +494,7 @@ ${freeSlots.length > 0 ? freeSlots.join("\n") : "No free times"}`,
             categories: a.categories,
           },
           a.calendar,
+          a.uid,
         );
 
         return {
@@ -436,6 +507,7 @@ ${freeSlots.length > 0 ? freeSlots.join("\n") : "No free times"}`,
 ${dayjs(a.start).format("YYYY-MM-DD HH:mm")} - ${dayjs(a.end).format("YYYY-MM-DD HH:mm")}${a.location ? `\nLocation: ${a.location}` : ""}
 
 Keep these to change or delete the event later:
+- uid: ${result.uid}
 - url: ${result.url}
 - etag: ${result.etag ?? "(not returned by the server; re-read the event before changing it)"}`,
             },
@@ -510,6 +582,72 @@ Keep these to change or delete the event later:
               type: "text",
               text: `✅ ${result.message}
 - url: ${a.url}${a.etag ? "" : "\n⚠️ Done without an etag: no check was made for changes since you read this event."}`,
+            },
+          ],
+        };
+      }
+
+      case "list_calendars": {
+        validateInput(listCalendarsSchema, args);
+        const calendars = await calendarService.listCalendars();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${calendars.length} calendars:\n\n${calendars
+                .map(
+                  cal =>
+                    `**${cal.name}**
+url: ${cal.url}${cal.color ? `\ncolor: ${cal.color}` : ""}${
+                      cal.components?.length
+                        ? `\ncomponents: ${cal.components.join(", ")}`
+                        : ""
+                    }`,
+                )
+                .join("\n---\n")}`,
+            },
+          ],
+        };
+      }
+
+      case "get_ics": {
+        const a = validateInput(getIcsSchema, args);
+        const raw = await calendarService.getIcs(a.url);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Raw iCalendar for ${raw.url}
+etag: ${raw.etag ?? "(none returned)"}
+
+${raw.ics}`,
+            },
+          ],
+        };
+      }
+
+      case "put_ics": {
+        const a = validateInput(putIcsSchema, args);
+        const result = await calendarService.putIcs(
+          a.calendar,
+          a.ics,
+          a.filename,
+          a.etag,
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ ${result.message}
+- uid: ${result.uid}
+- url: ${result.url}${
+                result.etag
+                  ? `\n- etag: ${result.etag}`
+                  : "\n- etag: (not returned by the server; re-read before the next change)"
+              }`,
             },
           ],
         };

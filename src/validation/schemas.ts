@@ -368,10 +368,23 @@ const eventBodySchema = {
 // is "end is not BEFORE start" rather than a strict ordering.
 const END_NOT_BEFORE_START = "End date must not be before start date";
 
+// An iCalendar UID from another system (e.g. "abc@google.com"). Free-form text,
+// not the numeric IMAP uid above; only trimmed and length-bounded.
+const icalUidSchema = v.pipe(
+  v.string("UID must be a string"),
+  v.trim(),
+  v.minLength(1, "UID cannot be empty"),
+  v.maxLength(255, "UID too long"),
+  v.transform(sanitizeString),
+);
+
 export const createEventSchema = v.pipe(
   v.object({
     ...eventBodySchema,
     calendar: v.optional(calendarNameSchema),
+    // Optional foreign UID so a mirrored copy shares one stable anchor with its
+    // origin. Omitted: the server mints its own.
+    uid: v.optional(icalUidSchema),
   }),
   v.check(
     data => new Date(data.end) >= new Date(data.start),
@@ -410,6 +423,49 @@ export const deleteEventSchema = v.object({
   recurrenceId: v.optional(dateSchema),
 });
 
+// list_calendars takes no arguments; the empty object keeps the validation path
+// uniform and rejects anything unexpected.
+export const listCalendarsSchema = v.object({});
+
+const caldavUrlSchema = v.pipe(
+  v.string("URL must be a string"),
+  v.trim(),
+  v.minLength(1, "URL cannot be empty"),
+  v.maxLength(2000, "URL too long"),
+);
+
+export const getIcsSchema = v.object({
+  url: caldavUrlSchema,
+});
+
+export const putIcsSchema = v.object({
+  // The calendar to write into; omitted uses the first calendar.
+  calendar: v.optional(calendarNameSchema),
+  // Raw VCALENDAR text. Deliberately NOT run through sanitizeString: that strips
+  // control characters including the CR/LF that iCalendar folding depends on,
+  // which would corrupt the body. Size-bounded instead.
+  ics: v.pipe(
+    v.string("ics must be a string"),
+    v.minLength(1, "ics cannot be empty"),
+    v.maxLength(1000000, "ics too long"),
+  ),
+  // Optional resource filename; defaults to "<uid>.ics" derived from the body.
+  filename: v.optional(
+    v.pipe(
+      v.string("filename must be a string"),
+      v.trim(),
+      v.maxLength(255, "filename too long"),
+      v.check(
+        str => !/[/\\]/.test(str),
+        "filename must not contain path separators",
+      ),
+    ),
+  ),
+  // When present, the write is a conditional replace (If-Match) of an existing
+  // resource; absent, it is a create.
+  etag: v.optional(v.pipe(v.string(), v.maxLength(200))),
+});
+
 // =============================================================================
 // SCHEMA TYPE EXPORTS
 // =============================================================================
@@ -432,6 +488,9 @@ export type GetFreeBusyInput = v.InferOutput<typeof getFreeBusySchema>;
 export type CreateEventInput = v.InferOutput<typeof createEventSchema>;
 export type UpdateEventInput = v.InferOutput<typeof updateEventSchema>;
 export type DeleteEventInput = v.InferOutput<typeof deleteEventSchema>;
+export type ListCalendarsInput = v.InferOutput<typeof listCalendarsSchema>;
+export type GetIcsInput = v.InferOutput<typeof getIcsSchema>;
+export type PutIcsInput = v.InferOutput<typeof putIcsSchema>;
 
 // =============================================================================
 // VALIDATION UTILITIES

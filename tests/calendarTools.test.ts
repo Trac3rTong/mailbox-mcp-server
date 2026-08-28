@@ -50,6 +50,9 @@ describe("Calendar Tools", () => {
         "create_event",
         "update_event",
         "delete_event",
+        "list_calendars",
+        "get_ics",
+        "put_ics",
       ]);
     });
 
@@ -618,6 +621,134 @@ describe("Calendar Tools", () => {
       );
       expect(mockCalendarService.deleteEvent).toHaveBeenCalledTimes(1);
       expect(mockCalendarService.cancelOccurrence).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("handleCalendarTool - sync primitives", () => {
+    it("prints the uid in get_calendar_events so a copy can be matched", async () => {
+      vi.mocked(mockCalendarService.getCalendarEvents!).mockResolvedValue([
+        mockEvent,
+      ]);
+
+      const result = await handleCalendarTool(
+        "get_calendar_events",
+        { start: "2025-06-20T00:00:00Z", end: "2025-06-21T00:00:00Z" },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(result.content[0].text).toContain("uid: event-1@example.com");
+    });
+
+    it("passes a foreign uid from create_event through to the service", async () => {
+      mockCalendarService.createEvent = vi.fn().mockResolvedValue({
+        success: true,
+        message: "created",
+        uid: "abc@google.com",
+        url: "https://caldav.example.com/cal/familie/abc%40google.com.ics",
+      });
+
+      const result = await handleCalendarTool(
+        "create_event",
+        {
+          summary: "Test",
+          start: "2026-09-01T09:00:00Z",
+          end: "2026-09-01T10:00:00Z",
+          calendar: "Familie",
+          uid: "abc@google.com",
+        },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(mockCalendarService.createEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ summary: "Test" }),
+        "Familie",
+        "abc@google.com",
+      );
+      expect(result.content[0].text).toContain("uid: abc@google.com");
+    });
+
+    it("lists calendars with their collection url", async () => {
+      mockCalendarService.listCalendars = vi.fn().mockResolvedValue([
+        {
+          name: "Familie",
+          url: "https://caldav.example.com/cal/familie/",
+          components: ["VEVENT"],
+        },
+        { name: "Leer", url: "https://caldav.example.com/cal/leer/" },
+      ]);
+
+      const result = await handleCalendarTool(
+        "list_calendars",
+        {},
+        mockCalendarService as CalendarService,
+      );
+
+      expect(result.content[0].text).toContain("Found 2 calendars");
+      expect(result.content[0].text).toContain("**Familie**");
+      expect(result.content[0].text).toContain(
+        "url: https://caldav.example.com/cal/familie/",
+      );
+      expect(result.content[0].text).toContain("**Leer**");
+    });
+
+    it("returns the raw body from get_ics", async () => {
+      mockCalendarService.getIcs = vi.fn().mockResolvedValue({
+        url: "https://caldav.example.com/cal/familie/x.ics",
+        etag: '"e1"',
+        ics: "BEGIN:VCALENDAR\nRRULE:FREQ=WEEKLY\nEND:VCALENDAR",
+      });
+
+      const result = await handleCalendarTool(
+        "get_ics",
+        { url: "https://caldav.example.com/cal/familie/x.ics" },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(mockCalendarService.getIcs).toHaveBeenCalledWith(
+        "https://caldav.example.com/cal/familie/x.ics",
+      );
+      expect(result.content[0].text).toContain("RRULE:FREQ=WEEKLY");
+      expect(result.content[0].text).toContain('etag: "e1"');
+    });
+
+    it("writes a raw body via put_ics and reports uid and url", async () => {
+      mockCalendarService.putIcs = vi.fn().mockResolvedValue({
+        success: true,
+        message: "written",
+        uid: "series-1@google.com",
+        url: "https://caldav.example.com/cal/familie/series-1%40google.com.ics",
+        etag: '"v1"',
+      });
+
+      const result = await handleCalendarTool(
+        "put_ics",
+        {
+          calendar: "Familie",
+          ics: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:series-1@google.com\nEND:VEVENT\nEND:VCALENDAR",
+        },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(mockCalendarService.putIcs).toHaveBeenCalledWith(
+        "Familie",
+        expect.stringContaining("UID:series-1@google.com"),
+        undefined,
+        undefined,
+      );
+      expect(result.content[0].text).toContain("uid: series-1@google.com");
+    });
+
+    it("rejects put_ics with an empty body at the validation layer", async () => {
+      mockCalendarService.putIcs = vi.fn();
+
+      const result = await handleCalendarTool(
+        "put_ics",
+        { calendar: "Familie", ics: "" },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(result.isError).toBe(true);
+      expect(mockCalendarService.putIcs).not.toHaveBeenCalled();
     });
   });
 

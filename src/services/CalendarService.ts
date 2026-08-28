@@ -8,9 +8,11 @@ import type {
   CalDavConnection,
   CalendarEvent,
   CalendarEventInput,
+  CalendarInfo,
   CalendarSearchOptions,
   CalendarWriteResult,
   FreeBusyInfo,
+  RawCalendarObject,
 } from "../types/calendar.types.js";
 import {
   CalendarError,
@@ -899,6 +901,7 @@ export class CalendarService {
   async createEvent(
     input: CalendarEventInput,
     calendarName?: string,
+    uid?: string,
   ): Promise<CalendarWriteResult> {
     if (input.end < input.start) {
       throw new ValidationError(
@@ -910,22 +913,163 @@ export class CalendarService {
 
     const client = await this.getClient();
     const calendar = await this.resolveCalendar(calendarName);
-    const uid = `${randomUUID()}@mailbox-mcp-server`;
-    const filename = `${uid}.ics`;
+    // A caller mirroring an event from another system passes that system's UID,
+    // so the two copies share one stable anchor: matching on title and time is
+    // not reliable because both can change. Without a UID we mint our own.
+    const eventUid = uid?.trim() || `${randomUUID()}@mailbox-mcp-server`;
+    const filename = `${eventUid}.ics`;
 
     const response = await client.createCalendarObject({
       calendar,
       filename,
-      iCalString: this.buildICalendar(input, uid),
+      iCalString: this.buildICalendar(input, eventUid),
     });
     this.assertWriteAccepted(response, "Creating the event");
 
     this.invalidateCalendarCache();
 
-    const url = `${calendar.url.replace(/\/?$/, "/")}${filename}`;
+    const url = `${calendar.url.replace(/\/?$/, "/")}${encodeURIComponent(filename)}`;
     return {
       success: true,
       message: `Event '${input.summary}' created in '${
+        (calendar.displayName as string) || calendar.url
+      }'`,
+      uid: eventUid,
+      url,
+      etag: response.headers?.get?.("etag") ?? undefined,
+    };
+  }
+
+  /**
+   * Lists the account's calendars. discoverCalendars() already fetches them but
+   * flattens each to a bare name; this keeps the collection URL (needed to write
+   * into it) and enough metadata to tell an empty real calendar from a typo. An
+   * empty calendar returns no events, so without this it is indistinguishable
+   * from one that does not exist.
+   */
+  async listCalendars(): Promise<CalendarInfo[]> {
+    try {
+      const client = await this.getClient();
+      const calendars = await this.circuitBreaker.execute(() =>
+        client.fetchCalendars(),
+      );
+
+      return calendars.map((cal: DAVCalendar) => {
+        const extra = cal as unknown as {
+          calendarColor?: unknown;
+          components?: unknown;
+          ctag?: unknown;
+        };
+        return {
+          name: (cal.displayName as string) || cal.url,
+          url: cal.url,
+          color:
+            typeof extra.calendarColor === "string"
+              ? extra.calendarColor
+              : undefined,
+          components: Array.isArray(extra.components)
+            ? (extra.components as string[])
+            : undefined,
+          ctag: typeof extra.ctag === "string" ? extra.ctag : undefined,
+        };
+      });
+    } catch (error) {
+      this.logger.error(
+        "Listing calendars failed",
+        { operation: "listCalendars", service: "CalendarService" },
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+      throw classifyTransportError(error, {
+        operation: "listCalendars",
+        service: "CalendarService",
+      });
+    }
+  }
+
+  /**
+   * Returns the raw iCalendar text of a single resource. The lossless half of a
+   * mirror: fetching the exact bytes and writing them elsewhere with put_ics
+   * preserves RRULE, EXDATE, per-occurrence overrides, attendees and alarms that
+   * a field-by-field copy would drop.
+   */
+  async getIcs(url: string): Promise<RawCalendarObject> {
+    const { data, etag } = await this.fetchRawObject(url);
+    return { url, etag, ics: data };
+  }
+
+  /** Reads the first VEVENT's UID from a VCALENDAR, failing loudly if absent. */
+  private uidFromIcs(ics: string): string {
+    let root: ICAL.Component;
+    try {
+      root = new ICAL.Component(ICAL.parse(ics));
+    } catch (error) {
+      throw new ValidationError(
+        `The iCalendar text could not be parsed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        "ics",
+        ics.slice(0, 80),
+      );
+    }
+    const vevent = root.getFirstSubcomponent("vevent");
+    const uid = vevent?.getFirstPropertyValue("uid");
+    if (!uid || typeof uid !== "string") {
+      throw new ValidationError(
+        "The iCalendar object has no VEVENT with a UID",
+        "ics",
+        undefined,
+      );
+    }
+    return uid;
+  }
+
+  /**
+   * Writes a raw iCalendar object into a calendar. The lossless counterpart to
+   * getIcs: the body is passed to the server verbatim, so a recurring series
+   * arrives with its rule intact — something create_event cannot express. With
+   * an etag it is a conditional replace of an existing resource; without one it
+   * is a create.
+   */
+  async putIcs(
+    calendarName: string | undefined,
+    ics: string,
+    filename?: string,
+    etag?: string,
+  ): Promise<CalendarWriteResult> {
+    // Parse first: a malformed body must fail here, not create junk on the
+    // server. The UID doubles as the default filename and the caller's anchor.
+    const uid = this.uidFromIcs(ics);
+
+    const client = await this.getClient();
+    const calendar = await this.resolveCalendar(calendarName);
+
+    const name = (filename ?? `${uid}.ics`).replace(/[/\\]/g, "");
+    const url = `${calendar.url.replace(/\/?$/, "/")}${encodeURIComponent(name)}`;
+
+    // tsdav reports refusal via Response.ok, not by throwing, so the result is
+    // inspected either way.
+    const response = etag
+      ? await client.updateCalendarObject({
+          calendarObject: { url, data: ics, etag },
+        })
+      : await client.createCalendarObject({
+          calendar,
+          filename: name,
+          iCalString: ics,
+        });
+
+    if (response?.status === 412) {
+      throw new CalendarError(
+        "The event was changed elsewhere since it was read",
+        ErrorCode.CALENDAR_EDIT_CONFLICT,
+      );
+    }
+    this.assertWriteAccepted(response, "Writing the iCalendar object");
+    this.invalidateCalendarCache();
+
+    return {
+      success: true,
+      message: `iCalendar object '${uid}' written to '${
         (calendar.displayName as string) || calendar.url
       }'`,
       uid,
