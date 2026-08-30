@@ -924,6 +924,19 @@ export class CalendarService {
       filename,
       iCalString: this.buildICalendar(input, eventUid),
     });
+    // tsdav sends If-None-Match: * on create, so a 412 means an event with this
+    // UID already exists (rather than a generic refusal). Name it plainly — this
+    // is the case a mirror hits when it re-runs on an already-copied event.
+    if (response?.status === 412) {
+      const message = `An event with UID '${eventUid}' already exists in this calendar — use a different UID or update the existing event`;
+      throw new CalendarError(
+        message,
+        ErrorCode.OPERATION_FAILED,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
+      );
+    }
     this.assertWriteAccepted(response, "Creating the event");
 
     this.invalidateCalendarCache();
@@ -1058,10 +1071,21 @@ export class CalendarService {
           iCalString: ics,
         });
 
+    // A 412 means two different things here. On the update path (etag given) the
+    // server refused an If-Match: the resource changed since it was read. On the
+    // create path (no etag) tsdav sends If-None-Match: *, so a 412 means a
+    // resource with this filename already exists — nothing was read, so the
+    // "changed elsewhere" wording would be wrong.
     if (response?.status === 412) {
+      const message = etag
+        ? "The event was changed elsewhere since it was read"
+        : `A calendar object named '${name}' already exists — pass its etag to replace it, or use a different filename`;
       throw new CalendarError(
-        "The event was changed elsewhere since it was read",
-        ErrorCode.CALENDAR_EDIT_CONFLICT,
+        message,
+        etag ? ErrorCode.CALENDAR_EDIT_CONFLICT : ErrorCode.OPERATION_FAILED,
+        undefined,
+        undefined,
+        { details: { userMessage: message } },
       );
     }
     this.assertWriteAccepted(response, "Writing the iCalendar object");

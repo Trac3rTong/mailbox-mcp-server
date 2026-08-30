@@ -667,12 +667,33 @@ describe("Calendar Tools", () => {
       expect(result.content[0].text).toContain("uid: abc@google.com");
     });
 
+    it("rejects a create_event uid with control characters instead of silently stripping it", async () => {
+      mockCalendarService.createEvent = vi.fn();
+
+      const result = await handleCalendarTool(
+        "create_event",
+        {
+          summary: "Test",
+          start: "2026-09-01T09:00:00Z",
+          end: "2026-09-01T10:00:00Z",
+          calendar: "Familie",
+          // A control character (SOH) the old silent-strip would have removed.
+          uid: `bad${String.fromCharCode(1)}uid@google.com`,
+        },
+        mockCalendarService as CalendarService,
+      );
+
+      expect(result.isError).toBe(true);
+      expect(mockCalendarService.createEvent).not.toHaveBeenCalled();
+    });
+
     it("lists calendars with their collection url", async () => {
       mockCalendarService.listCalendars = vi.fn().mockResolvedValue([
         {
           name: "Familie",
           url: "https://caldav.example.com/cal/familie/",
           components: ["VEVENT"],
+          ctag: "ctag-1",
         },
         { name: "Leer", url: "https://caldav.example.com/cal/leer/" },
       ]);
@@ -688,6 +709,8 @@ describe("Calendar Tools", () => {
       expect(result.content[0].text).toContain(
         "url: https://caldav.example.com/cal/familie/",
       );
+      // ctag is surfaced so a sync can use it for cheap change-detection.
+      expect(result.content[0].text).toContain("ctag: ctag-1");
       expect(result.content[0].text).toContain("**Leer**");
     });
 

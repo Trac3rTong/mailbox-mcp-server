@@ -375,7 +375,19 @@ const icalUidSchema = v.pipe(
   v.trim(),
   v.minLength(1, "UID cannot be empty"),
   v.maxLength(255, "UID too long"),
-  v.transform(sanitizeString),
+  // The foreign UID is the sync anchor. Reject control characters loudly rather
+  // than silently stripping them: a silent strip would change the anchor (so the
+  // two copies no longer match), and a raw CR/LF would fold-inject into the
+  // VEVENT that createEvent builds. put_ics keeps its UID verbatim, so this keeps
+  // create_event's fidelity in step instead of quietly diverging.
+  v.check(
+    uid =>
+      ![...uid].some(ch => {
+        const c = ch.charCodeAt(0);
+        return c <= 31 || c === 127 || (c >= 128 && c <= 159);
+      }),
+    "UID must not contain control characters",
+  ),
 );
 
 export const createEventSchema = v.pipe(

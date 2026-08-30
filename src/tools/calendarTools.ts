@@ -603,7 +603,7 @@ url: ${cal.url}${cal.color ? `\ncolor: ${cal.color}` : ""}${
                       cal.components?.length
                         ? `\ncomponents: ${cal.components.join(", ")}`
                         : ""
-                    }`,
+                    }${cal.ctag ? `\nctag: ${cal.ctag}` : ""}`,
                 )
                 .join("\n---\n")}`,
             },

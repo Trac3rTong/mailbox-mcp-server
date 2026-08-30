@@ -125,6 +125,16 @@ describe("CalendarService sync primitives", () => {
 
       expect(result.uid).toMatch(/@mailbox-mcp-server$/);
     });
+
+    it("names a UID collision (If-None-Match 412) instead of a generic refusal", async () => {
+      mockCreateCalendarObject.mockResolvedValue(
+        refused(412, "Precondition Failed"),
+      );
+
+      await expect(
+        service.createEvent(TERMIN, "Familie", "dup@google.com"),
+      ).rejects.toThrow(/already exists/i);
+    });
   });
 
   describe("listCalendars", () => {
@@ -209,6 +219,15 @@ describe("CalendarService sync primitives", () => {
       await expect(
         service.putIcs("Familie", SERIES_ICS, undefined, '"old"'),
       ).rejects.toThrow(/changed elsewhere/i);
+    });
+
+    it("names a create collision (412 without etag) as 'already exists', not a concurrent change", async () => {
+      mockCreateCalendarObject.mockResolvedValue(
+        refused(412, "Precondition Failed"),
+      );
+      await expect(service.putIcs("Familie", SERIES_ICS)).rejects.toThrow(
+        /already exists/i,
+      );
     });
 
     it("fails when the server refuses the create", async () => {
